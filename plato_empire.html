@@ -1,0 +1,1860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PLATO Empire</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+    user-select: none;
+  }
+  #gameContainer {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+  #gameCanvas { display: block; cursor: crosshair; }
+  #hudCanvas  { display: block; margin-top: 3px; }
+  #minimapCanvas {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    pointer-events: none; /* don't intercept mouse/keyboard input */
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="gameCanvas"></canvas>
+  <canvas id="hudCanvas"></canvas>
+  <canvas id="minimapCanvas"></canvas>
+</div>
+<script>
+'use strict';
+
+// =============================================================
+// SECTION 1: CONSTANTS & CONFIG
+// =============================================================
+
+const GRID_W = 256;           // toroidal world width
+const GRID_H = 256;           // toroidal world height
+
+const VIEW_W = 800;           // game canvas pixel width
+const VIEW_H = 800;           // game canvas pixel height
+const HUD_H  = 80;            // hud strip pixel height
+
+// Zoom: pixels per world unit. 40 world units visible across the view.
+const PPU = VIEW_W / 40;      // 20 px per world unit
+
+// Race identifiers
+const RACES = { FEDERATION: 0, ROMULAN: 1, ORION: 2, KAZARI: 3 };
+const RACE_NAMES   = ['Federation', 'Romulan', 'Orion', 'Kazari'];
+const RACE_LETTERS = ['F', 'R', 'O', 'K'];
+const RACE_COLORS  = ['#22aaff', '#ff4444', '#ffaa22', '#cc44ff'];
+
+// Phosphor palette sets (orange = PLATO default, green = classic terminal)
+const PHOSPHOR = {
+  ORANGE: { primary: '#ff9900', glow: '#ff5500', dim: '#331100' },
+  GREEN:  { primary: '#33ff66', glow: '#00cc44', dim: '#003311' },
+};
+
+// Planet layout
+const NUM_PLANETS     = 25;
+const CORNER_MARGIN   = 18;   // world units from grid corner for home clusters
+const ORBIT_RANGE     = 6;    // world units — planet "in range" for HUD
+const LAND_RANGE      = 4;    // world units — close enough to land/beam
+
+// Ship physics
+const TURN_RATE      = 2.2;   // radians per second (held key)
+const WARP_SPEEDS    = [0, 2, 4, 8, 16, 32, 64, 96, 144, 200]; // world units/sec
+const ENERGY_DRAIN   = [0, 1, 2, 4, 8, 16, 32, 48, 72, 100];   // energy/sec per warp
+const ENERGY_MAX     = 1000;
+const ENERGY_REGEN   = 120;   // energy/sec while landed on friendly planet
+const TORPEDO_START  = 10;
+const ARMY_START     = 5;
+
+// Combat
+const TORPEDO_SPEED      = 90;   // world units/sec
+const TORPEDO_RANGE      = 32;   // world units max travel
+const TORPEDO_DAMAGE     = 40;   // hull points (direct)
+const TORPEDO_SPLASH_R   = 3.5;  // world units radius
+const TORPEDO_SPLASH_DMG = 18;   // max splash hull pts
+const TORPEDO_COOLDOWN   = 0.5;  // seconds between shots
+const TORPEDO_ENERGY     = 15;   // energy per torpedo
+
+const PHASER_RANGE       = 14;   // world units
+const PHASER_HALF_ANGLE  = Math.PI / 6; // 30° half-cone
+const PHASER_DAMAGE      = 28;   // max hull pts at point-blank
+const PHASER_COOLDOWN    = 1.2;  // seconds
+const PHASER_ENERGY      = 35;   // energy per burst
+const PHASER_FX_DURATION = 0.35; // seconds phaser arc is visible
+
+// Hull health thresholds (hull=100 is full health, 0=dead)
+const THRESH_SHIELDS = 75; // hull below this → shields degraded
+const THRESH_WEAPONS = 50; // hull below this → weapons degraded
+const THRESH_ENGINES = 25; // hull below this → engines degraded
+
+// Planet economy
+const ARMY_REGEN_INTERVAL = 18; // seconds per new army on owned planet
+const PLANET_ARMY_MAX     = 20;
+const REPAIR_RATE         = 8;  // hull pts restored per second while repairing
+const REPAIR_ENERGY_COST  = 12; // energy/sec consumed while repairing
+
+// AI tuning
+const AI_SCAN_RADIUS     = 45;  // world units AI "sensor" range
+const AI_DECISION_RATE   = 0.6; // seconds between AI decisions
+const AI_ATTACK_HULL_MIN = 40;  // hull % below which AI retreats
+const AI_ARMY_THRESHOLD  = 6;   // armies needed before AI tries to conquer
+
+// Physics step
+const PHYSICS_STEP = 1 / 60;   // fixed 60 Hz physics
+
+// Mini-map dimensions
+const MM_SIZE      = 150;            // square map area (pixels)
+const MM_LABEL_H   = 16;            // space above map for "SECTOR MAP" label
+const MM_CANVAS_H  = MM_LABEL_H + MM_SIZE; // total canvas height
+const MM_SCALE     = MM_SIZE / GRID_W;     // world unit → minimap pixel
+
+
+// =============================================================
+// SECTION 2: GAME STATE
+// =============================================================
+
+// --- Factory functions ---
+
+function createShip(race, x, y, isPlayer) {
+  return {
+    race, isPlayer, alive: true,
+    x, y,
+    heading: 0,           // radians (0 = right, PI/2 = down)
+    warp: 0,
+    hull: 100,            // 100 = full health, 0 = destroyed
+    shields: 100,         // 0-100 absorb rating
+    energy: ENERGY_MAX,
+    torpedoes: TORPEDO_START,
+    armies: ARMY_START,
+    torpedoCooldown: 0,
+    phaserCooldown: 0,
+    repairing: false,
+    landedOn: null,       // planet object or null
+    trail: [],            // [{x,y,age}]
+    // Computed damage flags (updated each tick)
+    shieldsDown: false,
+    weaponsDown: false,
+    enginesDown: false,
+    // AI brain (null for player)
+    ai: isPlayer ? null : createAI(),
+  };
+}
+
+function createPlanet(id, x, y, race, isHome) {
+  const def = isHome
+    ? 8
+    : Math.floor(Math.random() * 8) + 1;
+  return {
+    id, x, y,
+    race,               // null = neutral
+    isHome,
+    defense: def,
+    armies: isHome ? 4 : Math.floor(Math.random() * 3),
+    armyRegenTimer: Math.random() * ARMY_REGEN_INTERVAL,
+    flickerPhase: Math.random() * Math.PI * 2,
+  };
+}
+
+function createTorpedo(ownerRace, x, y, heading) {
+  return {
+    ownerRace, x, y, heading,
+    prevX: x, prevY: y,
+    distanceTraveled: 0,
+    alive: true,
+  };
+}
+
+function createPhaserFX(x, y, heading) {
+  return { x, y, heading, age: 0, ownerRace: 0 };
+}
+
+function createAI() {
+  return {
+    state: 'PATROL',       // PATROL | ATTACK | RETREAT | CONQUER
+    targetShip: null,
+    targetPlanet: null,
+    waypointX: Math.random() * GRID_W,
+    waypointY: Math.random() * GRID_H,
+    decisionTimer: Math.random() * AI_DECISION_RATE,
+  };
+}
+
+// --- Master state object ---
+const G = {
+  ships:    [],
+  planets:  [],
+  torpedoes:[],
+  phaserFX: [],
+  player:   null,
+  playerRace: 0,
+  phosphorMode: 'ORANGE',
+  phase: 'RACE_SELECT',   // RACE_SELECT | PLAYING | WIN | LOSE
+  keys: {},
+  messages: [],           // [{text, age, duration}]
+  stars: [],
+  // Canvases / contexts (set in init)
+  ctx: null,
+  hudCtx: null,
+  mmCtx: null,          // minimap canvas context
+  minimapVisible: true, // toggled with M key
+  // Timing
+  lastTimestamp: 0,
+  physicsAccum: 0,
+  gameTime: 0,
+  // Self-destruct state for player
+  selfDestructArmed: false,
+  selfDestructTimer: 0,
+  // Race select highlight
+  raceSelectHover: 0,
+};
+
+
+// =============================================================
+// SECTION 3: INPUT HANDLING
+// =============================================================
+
+const KEY_MAP = {
+  'ArrowUp':    'thrustUp',
+  'ArrowDown':  'thrustDown',
+  'ArrowLeft':  'turnLeft',
+  'ArrowRight': 'turnRight',
+  'KeyW': 'thrustUp',
+  'KeyS': 'thrustDown',
+  'KeyA': 'turnLeft',
+  'KeyD': 'turnRight',
+  'KeyT': 'torpedo',
+  'KeyP': 'phasers',
+  'KeyL': 'land',
+  'KeyB': 'beam',
+  'KeyR': 'repair',
+  'KeyQ': 'selfDestruct',
+  'KeyG': 'togglePhosphor',
+  'Digit0': 'warp0', 'Digit1': 'warp1', 'Digit2': 'warp2',
+  'Digit3': 'warp3', 'Digit4': 'warp4', 'Digit5': 'warp5',
+  'Digit6': 'warp6', 'Digit7': 'warp7', 'Digit8': 'warp8',
+  'Digit9': 'warp9',
+  'KeyM': 'toggleMinimap',
+};
+
+document.addEventListener('keydown', e => {
+  const action = KEY_MAP[e.code];
+  if (!action) return;
+  e.preventDefault();
+
+  // M = toggle minimap works in all phases
+  if (action === 'toggleMinimap') {
+    G.minimapVisible = !G.minimapVisible;
+    const mmEl = document.getElementById('minimapCanvas');
+    if (mmEl) mmEl.style.display = G.minimapVisible ? 'block' : 'none';
+    return;
+  }
+
+  // Race select screen
+  if (G.phase === 'RACE_SELECT') {
+    if (e.code === 'Digit1') startGame(0);
+    if (e.code === 'Digit2') startGame(1);
+    if (e.code === 'Digit3') startGame(2);
+    if (e.code === 'Digit4') startGame(3);
+    return;
+  }
+
+  // Win/Lose restart
+  if (G.phase === 'WIN' || G.phase === 'LOSE') {
+    if (e.code === 'KeyR') { G.phase = 'RACE_SELECT'; return; }
+    return;
+  }
+
+  if (G.phase !== 'PLAYING') return;
+
+  // Mark key held
+  G.keys[action] = true;
+
+  // One-shot discrete actions
+  if (action.startsWith('warp')) {
+    const n = parseInt(action.slice(4));
+    setWarp(G.player, n);
+  }
+  if (action === 'thrustUp')   setWarp(G.player, Math.min(9, G.player.warp + 1));
+  if (action === 'thrustDown') setWarp(G.player, Math.max(0, G.player.warp - 1));
+  if (action === 'torpedo')    fireTorpedo(G.player);
+  if (action === 'phasers')    firePhasers(G.player);
+  if (action === 'land')       tryLand(G.player);
+  if (action === 'beam')       tryBeam(G.player);
+  if (action === 'repair')     toggleRepair(G.player);
+  if (action === 'selfDestruct') handleSelfDestruct(G.player);
+  if (action === 'togglePhosphor') {
+    G.phosphorMode = G.phosphorMode === 'ORANGE' ? 'GREEN' : 'ORANGE';
+    addMessage('PHOSPHOR: ' + G.phosphorMode);
+  }
+});
+
+document.addEventListener('keyup', e => {
+  const action = KEY_MAP[e.code];
+  if (action) G.keys[action] = false;
+});
+
+function setWarp(ship, n) {
+  if (ship.enginesDown && n > 2) {
+    n = 2;
+    addMessage('ENGINES DAMAGED — WARP LIMITED');
+  }
+  if (ship.energy <= 0 && n > 0) {
+    addMessage('INSUFFICIENT ENERGY');
+    return;
+  }
+  // Lift off planet when changing warp
+  if (n > 0 && ship.landedOn) {
+    ship.landedOn = null;
+    ship.repairing = false;
+    addMessage('DEPARTED ORBIT');
+  }
+  ship.warp = n;
+}
+
+function handleSelfDestruct(ship) {
+  if (!G.selfDestructArmed) {
+    G.selfDestructArmed = true;
+    G.selfDestructTimer = 3;
+    addMessage('SELF-DESTRUCT ARMED — PRESS Q AGAIN TO CONFIRM');
+  } else {
+    addMessage('SELF-DESTRUCT INITIATED!');
+    // Create a big splash
+    torpedoSplash(ship.x, ship.y, -1); // -1 race = hits everyone
+    destroyShip(ship);
+    G.selfDestructArmed = false;
+  }
+}
+
+function processInput(ship, dt) {
+  if (!ship.isPlayer || !ship.alive) return;
+  if (ship.landedOn) return;
+  if (G.keys.turnLeft)  ship.heading -= TURN_RATE * dt;
+  if (G.keys.turnRight) ship.heading += TURN_RATE * dt;
+  // Normalize heading
+  ship.heading = ((ship.heading % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+}
+
+
+// =============================================================
+// SECTION 4: PHYSICS & MOVEMENT
+// =============================================================
+
+// --- Toroidal math ---
+
+function wrapCoord(v, max) {
+  return ((v % max) + max) % max;
+}
+
+function toroidalDist(ax, ay, bx, by) {
+  let dx = Math.abs(bx - ax);
+  let dy = Math.abs(by - ay);
+  if (dx > GRID_W / 2) dx = GRID_W - dx;
+  if (dy > GRID_H / 2) dy = GRID_H - dy;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Returns shortest-path delta from a→b (toroidal)
+function toroidalDelta(ax, ay, bx, by) {
+  let dx = bx - ax;
+  let dy = by - ay;
+  if (dx >  GRID_W / 2) dx -= GRID_W;
+  if (dx < -GRID_W / 2) dx += GRID_W;
+  if (dy >  GRID_H / 2) dy -= GRID_H;
+  if (dy < -GRID_H / 2) dy += GRID_H;
+  return { dx, dy };
+}
+
+// Convert world coords to canvas screen coords (player always centred)
+function worldToScreen(wx, wy) {
+  const camX = G.player ? G.player.x : GRID_W / 2;
+  const camY = G.player ? G.player.y : GRID_H / 2;
+  const { dx, dy } = toroidalDelta(camX, camY, wx, wy);
+  return {
+    sx: VIEW_W / 2 + dx * PPU,
+    sy: VIEW_H / 2 + dy * PPU,
+  };
+}
+
+// Call drawFn(sx,sy) for each ghost copy that falls within the viewport
+function drawAtWrapped(wx, wy, drawFn) {
+  const offsets = [
+    [0,0],[GRID_W,0],[-GRID_W,0],
+    [0,GRID_H],[0,-GRID_H],
+    [GRID_W,GRID_H],[-GRID_W,GRID_H],
+    [GRID_W,-GRID_H],[-GRID_W,-GRID_H],
+  ];
+  const margin = 60;
+  for (const [ox, oy] of offsets) {
+    const { sx, sy } = worldToScreen(wx + ox, wy + oy);
+    if (sx > -margin && sx < VIEW_W + margin && sy > -margin && sy < VIEW_H + margin) {
+      drawFn(sx, sy);
+    }
+  }
+}
+
+// --- Ship update ---
+
+function updateShip(ship, dt) {
+  if (!ship.alive) return;
+
+  // Self-destruct timer for AI (handled in AI section)
+  // For player, handled separately
+
+  // If landed on planet: skip movement, handle repair/regen
+  if (ship.landedOn) {
+    const planet = ship.landedOn;
+    // If planet captured by enemy, eject
+    if (planet.race !== ship.race) {
+      ship.landedOn = null;
+      if (ship.isPlayer) addMessage('PLANET LOST — EJECTED FROM ORBIT');
+    } else {
+      // Energy regen
+      ship.energy = Math.min(ENERGY_MAX, ship.energy + ENERGY_REGEN * dt);
+      // Repair
+      if (ship.repairing && ship.energy > 10) {
+        ship.hull = Math.min(100, ship.hull + REPAIR_RATE * dt);
+        ship.energy -= REPAIR_ENERGY_COST * dt;
+      }
+    }
+    // Update damage flags even while landed
+    updateDamageFlags(ship);
+    updateCooldowns(ship, dt);
+    return;
+  }
+
+  // Movement
+  const speedMult = ship.enginesDown ? 0.3 : 1.0;
+  const speed = WARP_SPEEDS[ship.warp] * speedMult;
+
+  ship.x += Math.cos(ship.heading) * speed * dt;
+  ship.y += Math.sin(ship.heading) * speed * dt;
+  ship.x = wrapCoord(ship.x, GRID_W);
+  ship.y = wrapCoord(ship.y, GRID_H);
+
+  // Energy drain
+  ship.energy -= ENERGY_DRAIN[ship.warp] * dt;
+  if (ship.energy < 0) {
+    ship.energy = 0;
+    if (ship.warp > 0) {
+      ship.warp = 0;
+      if (ship.isPlayer) addMessage('ENERGY DEPLETED — WARP OFFLINE');
+    }
+  }
+
+  // Trail
+  if (ship.warp > 0) {
+    ship.trail.push({ x: ship.x, y: ship.y, age: 0 });
+    if (ship.trail.length > 22) ship.trail.shift();
+  }
+  for (const pt of ship.trail) pt.age += dt;
+
+  updateDamageFlags(ship);
+  updateCooldowns(ship, dt);
+}
+
+function updateDamageFlags(ship) {
+  ship.shieldsDown = ship.hull < THRESH_SHIELDS;
+  ship.weaponsDown = ship.hull < THRESH_WEAPONS;
+  ship.enginesDown = ship.hull < THRESH_ENGINES;
+}
+
+function updateCooldowns(ship, dt) {
+  if (ship.torpedoCooldown > 0) ship.torpedoCooldown -= dt;
+  if (ship.phaserCooldown  > 0) ship.phaserCooldown  -= dt;
+}
+
+
+// =============================================================
+// SECTION 5: COMBAT SYSTEM
+// =============================================================
+
+function fireTorpedo(ship) {
+  if (!ship.alive || ship.landedOn) return;
+  if (ship.weaponsDown) { if (ship.isPlayer) addMessage('WEAPONS OFFLINE'); return; }
+  if (ship.torpedoes <= 0) { if (ship.isPlayer) addMessage('NO TORPEDOES'); return; }
+  if (ship.torpedoCooldown > 0) return;
+  if (ship.energy < TORPEDO_ENERGY) { if (ship.isPlayer) addMessage('INSUFFICIENT ENERGY'); return; }
+
+  ship.torpedoes--;
+  ship.energy -= TORPEDO_ENERGY;
+  ship.torpedoCooldown = TORPEDO_COOLDOWN;
+
+  G.torpedoes.push(createTorpedo(ship.race, ship.x, ship.y, ship.heading));
+}
+
+function firePhasers(ship) {
+  if (!ship.alive || ship.landedOn) return;
+  if (ship.weaponsDown) { if (ship.isPlayer) addMessage('WEAPONS OFFLINE'); return; }
+  if (ship.phaserCooldown > 0) return;
+  if (ship.energy < PHASER_ENERGY) { if (ship.isPlayer) addMessage('INSUFFICIENT ENERGY'); return; }
+
+  ship.energy -= PHASER_ENERGY;
+  ship.phaserCooldown = PHASER_COOLDOWN;
+
+  const fx = createPhaserFX(ship.x, ship.y, ship.heading);
+  fx.ownerRace = ship.race;
+  G.phaserFX.push(fx);
+
+  // Instant hit: check all enemy ships in cone
+  for (const target of G.ships) {
+    if (!target.alive) continue;
+    if (target.race === ship.race) continue;
+
+    const d = toroidalDist(ship.x, ship.y, target.x, target.y);
+    if (d > PHASER_RANGE) continue;
+
+    const { dx, dy } = toroidalDelta(ship.x, ship.y, target.x, target.y);
+    const angleToTarget = Math.atan2(dy, dx);
+    let angleDiff = angleToTarget - ship.heading;
+    while (angleDiff >  Math.PI) angleDiff -= Math.PI * 2;
+    while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+
+    if (Math.abs(angleDiff) <= PHASER_HALF_ANGLE) {
+      const falloff = 1 - d / PHASER_RANGE;
+      applyDamage(target, PHASER_DAMAGE * falloff);
+    }
+  }
+}
+
+function updateTorpedoes(dt) {
+  for (const torp of G.torpedoes) {
+    if (!torp.alive) continue;
+
+    torp.prevX = torp.x;
+    torp.prevY = torp.y;
+
+    const dist = TORPEDO_SPEED * dt;
+    torp.x += Math.cos(torp.heading) * dist;
+    torp.y += Math.sin(torp.heading) * dist;
+    torp.x = wrapCoord(torp.x, GRID_W);
+    torp.y = wrapCoord(torp.y, GRID_H);
+    torp.distanceTraveled += dist;
+
+    if (torp.distanceTraveled >= TORPEDO_RANGE) {
+      torp.alive = false;
+      continue;
+    }
+
+    // Ship collision (direct hit)
+    let hit = false;
+    for (const ship of G.ships) {
+      if (!ship.alive) continue;
+      if (ship.race === torp.ownerRace) continue;
+
+      const d = toroidalDist(torp.x, torp.y, ship.x, ship.y);
+      if (d < 1.8) {
+        applyDamage(ship, TORPEDO_DAMAGE);
+        torpedoSplash(torp.x, torp.y, torp.ownerRace);
+        torp.alive = false;
+        hit = true;
+        break;
+      }
+    }
+    if (hit) continue;
+
+    // Planet collision (detonate but no planet damage)
+    for (const planet of G.planets) {
+      const d = toroidalDist(torp.x, torp.y, planet.x, planet.y);
+      if (d < 1.2) {
+        torpedoSplash(torp.x, torp.y, torp.ownerRace);
+        torp.alive = false;
+        break;
+      }
+    }
+  }
+
+  G.torpedoes = G.torpedoes.filter(t => t.alive);
+}
+
+function torpedoSplash(cx, cy, ownerRace) {
+  for (const ship of G.ships) {
+    if (!ship.alive) continue;
+    if (ownerRace !== -1 && ship.race === ownerRace) continue;
+
+    const d = toroidalDist(cx, cy, ship.x, ship.y);
+    if (d < TORPEDO_SPLASH_R) {
+      const falloff = 1 - d / TORPEDO_SPLASH_R;
+      applyDamage(ship, TORPEDO_SPLASH_DMG * falloff);
+    }
+  }
+}
+
+function applyDamage(ship, amount) {
+  if (!ship.alive) return;
+
+  // Capture pre-damage flag state for change detection
+  const prevShieldsDown = ship.shieldsDown;
+  const prevWeaponsDown = ship.weaponsDown;
+  const prevEnginesDown = ship.enginesDown;
+
+  // Shields absorb portion of damage while operational
+  if (!ship.shieldsDown && ship.shields > 0) {
+    const absorbed = Math.min(ship.shields, amount * 0.55);
+    ship.shields -= absorbed;
+    amount -= absorbed;
+  }
+
+  ship.hull -= amount;
+  if (ship.hull < 0) ship.hull = 0;
+
+  updateDamageFlags(ship);
+
+  if (ship.hull <= 0) {
+    destroyShip(ship);
+  } else if (ship.isPlayer) {
+    // Alert player only when a system NEWLY fails (crossing threshold for the first time)
+    if (!prevShieldsDown && ship.shieldsDown) addMessage('WARNING: SHIELDS DEGRADED');
+    if (!prevWeaponsDown && ship.weaponsDown) addMessage('WARNING: WEAPONS DAMAGED');
+    if (!prevEnginesDown && ship.enginesDown) addMessage('WARNING: ENGINES DAMAGED');
+  }
+}
+
+function destroyShip(ship) {
+  ship.alive = false;
+  ship.warp = 0;
+  if (ship.landedOn) ship.landedOn = null;
+
+  // Create explosion flash effect (reuse phaserFX array with special marker)
+  const fx = createPhaserFX(ship.x, ship.y, 0);
+  fx.isExplosion = true;
+  fx.ownerRace = ship.race;
+  G.phaserFX.push(fx);
+
+  if (ship.isPlayer) {
+    setTimeout(() => {
+      G.phase = 'LOSE';
+    }, 1200);
+  }
+}
+
+function toggleRepair(ship) {
+  if (!ship.alive) return;
+  const planet = getNearestPlanetInRange(ship, LAND_RANGE);
+  if (!planet || planet.race !== ship.race) {
+    if (ship.isPlayer) addMessage('MUST BE AT FRIENDLY PLANET TO REPAIR');
+    return;
+  }
+  // If not landed yet, land first
+  if (!ship.landedOn) {
+    ship.landedOn = planet;
+    ship.warp = 0;
+  }
+  ship.repairing = !ship.repairing;
+  if (ship.isPlayer) addMessage(ship.repairing ? 'REPAIR SYSTEMS ONLINE' : 'REPAIR SYSTEMS OFFLINE');
+}
+
+
+// =============================================================
+// SECTION 6: AI LOGIC
+// =============================================================
+
+function updateAI(ship, dt) {
+  if (!ship.alive || !ship.ai) return;
+
+  const ai = ship.ai;
+  ai.decisionTimer -= dt;
+
+  // Always execute current state behaviour every tick
+  executeAIMovement(ship, dt);
+
+  // Periodic decisions
+  if (ai.decisionTimer > 0) return;
+  ai.decisionTimer = AI_DECISION_RATE + Math.random() * 0.3;
+
+  // Scan for nearest enemy ship
+  let nearestEnemy = null, nearestEnemyDist = Infinity;
+  for (const other of G.ships) {
+    if (!other.alive || other.race === ship.race) continue;
+    const d = toroidalDist(ship.x, ship.y, other.x, other.y);
+    if (d < nearestEnemyDist) { nearestEnemyDist = d; nearestEnemy = other; }
+  }
+
+  // Scan for nearest enemy/neutral planet
+  let nearestTargetPlanet = null, nearestTargetDist = Infinity;
+  for (const planet of G.planets) {
+    if (planet.race === ship.race) continue;
+    const d = toroidalDist(ship.x, ship.y, planet.x, planet.y);
+    if (d < nearestTargetDist) { nearestTargetDist = d; nearestTargetPlanet = planet; }
+  }
+
+  // Scan for nearest friendly planet (for retreat)
+  let nearestFriendly = null, nearestFriendlyDist = Infinity;
+  for (const planet of G.planets) {
+    if (planet.race !== ship.race) continue;
+    const d = toroidalDist(ship.x, ship.y, planet.x, planet.y);
+    if (d < nearestFriendlyDist) { nearestFriendlyDist = d; nearestFriendly = planet; }
+  }
+
+  // State machine transitions
+  switch (ai.state) {
+    case 'PATROL':
+      if (nearestEnemy && nearestEnemyDist < AI_SCAN_RADIUS && ship.hull > AI_ATTACK_HULL_MIN) {
+        ai.state = 'ATTACK';
+        ai.targetShip = nearestEnemy;
+      } else if (ship.armies >= AI_ARMY_THRESHOLD && nearestTargetPlanet && nearestTargetDist < AI_SCAN_RADIUS * 1.5) {
+        ai.state = 'CONQUER';
+        ai.targetPlanet = nearestTargetPlanet;
+      }
+      break;
+
+    case 'ATTACK':
+      if (ship.hull <= AI_ATTACK_HULL_MIN || ship.energy < 150) {
+        ai.state = 'RETREAT';
+        ai.targetPlanet = nearestFriendly;
+      } else if (!nearestEnemy || nearestEnemyDist > AI_SCAN_RADIUS * 1.5) {
+        ai.state = 'PATROL';
+        ai.targetShip = null;
+        ai.waypointX = Math.random() * GRID_W;
+        ai.waypointY = Math.random() * GRID_H;
+      } else {
+        ai.targetShip = nearestEnemy;
+      }
+      break;
+
+    case 'RETREAT':
+      if (!nearestFriendly) {
+        ai.state = 'PATROL';
+        break;
+      }
+      // Arrived at friendly planet?
+      if (nearestFriendlyDist < LAND_RANGE) {
+        ship.landedOn = nearestFriendly;
+        ship.warp = 0;
+        ship.repairing = true;
+        // Wait until hull is recovered
+        if (ship.hull > 80) {
+          ship.landedOn = null;
+          ship.repairing = false;
+          ai.state = 'PATROL';
+          ai.waypointX = Math.random() * GRID_W;
+          ai.waypointY = Math.random() * GRID_H;
+        }
+      } else {
+        ai.targetPlanet = nearestFriendly;
+      }
+      break;
+
+    case 'CONQUER':
+      // Interrupted by close enemy
+      if (nearestEnemy && nearestEnemyDist < AI_SCAN_RADIUS * 0.6 && ship.hull > AI_ATTACK_HULL_MIN) {
+        ai.state = 'ATTACK';
+        ai.targetShip = nearestEnemy;
+        break;
+      }
+      if (!nearestTargetPlanet) {
+        ai.state = 'PATROL';
+        break;
+      }
+      ai.targetPlanet = nearestTargetPlanet;
+
+      // Attempt to beam if in range
+      if (nearestTargetDist < LAND_RANGE && ship.armies > nearestTargetPlanet.defense) {
+        beamDown(ship, nearestTargetPlanet);
+        ai.state = 'PATROL';
+        ai.waypointX = Math.random() * GRID_W;
+        ai.waypointY = Math.random() * GRID_H;
+      }
+      break;
+  }
+}
+
+function executeAIMovement(ship, dt) {
+  if (ship.landedOn) return; // handled in updateShip
+
+  const ai = ship.ai;
+
+  // Heading and warp for each state
+  switch (ai.state) {
+    case 'PATROL': {
+      const { dx, dy } = toroidalDelta(ship.x, ship.y, ai.waypointX, ai.waypointY);
+      const desiredH = Math.atan2(dy, dx);
+      turnToward(ship, desiredH, dt);
+      ship.warp = 3;
+      if (toroidalDist(ship.x, ship.y, ai.waypointX, ai.waypointY) < 3) {
+        ai.waypointX = Math.random() * GRID_W;
+        ai.waypointY = Math.random() * GRID_H;
+      }
+      break;
+    }
+    case 'ATTACK': {
+      if (!ai.targetShip || !ai.targetShip.alive) {
+        ai.state = 'PATROL';
+        return;
+      }
+      const dist = toroidalDist(ship.x, ship.y, ai.targetShip.x, ai.targetShip.y);
+      const { dx, dy } = toroidalDelta(ship.x, ship.y, ai.targetShip.x, ai.targetShip.y);
+      turnToward(ship, Math.atan2(dy, dx), dt);
+      ship.warp = dist > 20 ? 5 : (dist > 8 ? 3 : 1);
+
+      // Fire weapons
+      if (dist < PHASER_RANGE) firePhasers(ship);
+      if (dist < TORPEDO_RANGE * 0.75 && ship.torpedoes > 0) fireTorpedo(ship);
+      break;
+    }
+    case 'RETREAT': {
+      if (!ai.targetPlanet) return;
+      const { dx, dy } = toroidalDelta(ship.x, ship.y, ai.targetPlanet.x, ai.targetPlanet.y);
+      turnToward(ship, Math.atan2(dy, dx), dt);
+      ship.warp = 6;
+      break;
+    }
+    case 'CONQUER': {
+      if (!ai.targetPlanet) return;
+      const dist = toroidalDist(ship.x, ship.y, ai.targetPlanet.x, ai.targetPlanet.y);
+      const { dx, dy } = toroidalDelta(ship.x, ship.y, ai.targetPlanet.x, ai.targetPlanet.y);
+      turnToward(ship, Math.atan2(dy, dx), dt);
+      ship.warp = dist > 8 ? 4 : 1;
+      break;
+    }
+  }
+}
+
+function turnToward(ship, desiredHeading, dt) {
+  let diff = desiredHeading - ship.heading;
+  while (diff >  Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  const maxTurn = TURN_RATE * dt * (ship.enginesDown ? 0.5 : 1);
+  ship.heading += Math.sign(diff) * Math.min(Math.abs(diff), maxTurn);
+  ship.heading = ((ship.heading % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+}
+
+
+// =============================================================
+// SECTION 7: PLANET SYSTEM
+// =============================================================
+
+function initPlanets() {
+  const planets = [];
+  const M = CORNER_MARGIN;
+
+  // Home planet clusters: 3 per race, one at each corner
+  // Federation=top-left, Romulan=top-right, Orion=bottom-left, Kazari=bottom-right
+  const corners = [
+    [RACES.FEDERATION, M,          M         ],
+    [RACES.ROMULAN,    GRID_W - M, M         ],
+    [RACES.ORION,      M,          GRID_H - M],
+    [RACES.KAZARI,     GRID_W - M, GRID_H - M],
+  ];
+  // Small triangle offsets around corner centre
+  const homeOffsets = [[0, 0], [7, -4], [-4, 7]];
+
+  let id = 0;
+  for (const [race, cx, cy] of corners) {
+    for (const [ox, oy] of homeOffsets) {
+      planets.push(createPlanet(id++, wrapCoord(cx + ox, GRID_W), wrapCoord(cy + oy, GRID_H), race, true));
+    }
+  }
+
+  // 13 neutral planets, scattered with minimum spacing
+  let attempts = 0;
+  while (planets.length < NUM_PLANETS && attempts < 10000) {
+    attempts++;
+    // Bias toward the middle of the grid (avoid corners)
+    const x = 20 + Math.random() * (GRID_W - 40);
+    const y = 20 + Math.random() * (GRID_H - 40);
+    let tooClose = false;
+    for (const p of planets) {
+      if (toroidalDist(x, y, p.x, p.y) < 14) { tooClose = true; break; }
+    }
+    if (!tooClose) {
+      planets.push(createPlanet(id++, x, y, null, false));
+    }
+  }
+
+  return planets;
+}
+
+function updatePlanets(dt) {
+  for (const planet of G.planets) {
+    // Army regeneration on owned planets
+    if (planet.race !== null) {
+      planet.armyRegenTimer -= dt;
+      if (planet.armyRegenTimer <= 0) {
+        planet.armyRegenTimer = ARMY_REGEN_INTERVAL;
+        if (planet.armies < PLANET_ARMY_MAX) planet.armies++;
+      }
+    }
+
+    // Flicker animation
+    planet.flickerPhase += dt * 1.8;
+  }
+}
+
+function getNearestPlanetInRange(ship, range) {
+  let nearest = null, nearestDist = Infinity;
+  for (const planet of G.planets) {
+    const d = toroidalDist(ship.x, ship.y, planet.x, planet.y);
+    if (d < range && d < nearestDist) { nearest = planet; nearestDist = d; }
+  }
+  return nearest;
+}
+
+function tryLand(ship) {
+  if (!ship.alive) return;
+  const planet = getNearestPlanetInRange(ship, LAND_RANGE);
+  if (!planet) {
+    if (ship.isPlayer) addMessage('NO PLANET IN RANGE TO LAND');
+    return;
+  }
+  if (planet.race !== ship.race) {
+    if (ship.isPlayer) addMessage('CANNOT LAND ON ENEMY PLANET — CONQUER IT FIRST');
+    return;
+  }
+  ship.landedOn = planet;
+  ship.warp = 0;
+  if (ship.isPlayer) addMessage(`LANDED ON PLANET ${planet.id} (${RACE_NAMES[planet.race]})`);
+}
+
+function tryBeam(ship) {
+  if (!ship.alive) return;
+  const planet = getNearestPlanetInRange(ship, LAND_RANGE);
+  if (!planet) {
+    if (ship.isPlayer) addMessage('NO PLANET IN BEAM RANGE');
+    return;
+  }
+  beamDown(ship, planet);
+}
+
+function beamDown(ship, planet) {
+  if (ship.armies <= 0) {
+    if (ship.isPlayer) addMessage('NO ARMIES ABOARD');
+    return;
+  }
+
+  const beamed = ship.armies;
+  ship.armies = 0;
+
+  if (planet.race === ship.race) {
+    // Reinforce friendly planet
+    planet.armies = Math.min(planet.armies + beamed, PLANET_ARMY_MAX);
+    if (ship.isPlayer) addMessage(`REINFORCED PLANET ${planet.id} WITH ${beamed} ARMIES`);
+  } else {
+    // Assault: compare beamed armies vs planet defense
+    const netForce = beamed - planet.defense;
+    if (netForce > 0) {
+      // Conquest!
+      const prevRace = planet.race;
+      planet.race = ship.race;
+      planet.defense = Math.max(1, Math.floor(netForce / 2));
+      planet.armies  = Math.floor(netForce / 2);
+      if (ship.isPlayer) {
+        addMessage(`PLANET ${planet.id} CONQUERED! (was ${prevRace !== null ? RACE_NAMES[prevRace] : 'Neutral'})`);
+      }
+      checkWinCondition();
+    } else {
+      // Assault failed
+      planet.defense -= beamed;
+      if (ship.isPlayer) addMessage(`ASSAULT FAILED — ${planet.defense} DEFENDERS REMAIN`);
+    }
+  }
+}
+
+function checkWinCondition() {
+  if (G.phase !== 'PLAYING') return; // prevent re-entry
+  const allOwned = G.planets.every(p => p.race === G.playerRace);
+  if (allOwned) {
+    G.phase = 'WIN'; // immediate so no further actions process
+    addMessage('ALL PLANETS CONQUERED — VICTORY!');
+  }
+}
+
+function addMessage(text, duration = 3.5) {
+  G.messages.push({ text, age: 0, duration });
+  if (G.messages.length > 6) G.messages.shift();
+}
+
+
+// =============================================================
+// SECTION 8: RENDERING
+// =============================================================
+
+// --- Phosphor helpers ---
+
+function phosphorPrimary() { return PHOSPHOR[G.phosphorMode].primary; }
+function phosphorGlow()    { return PHOSPHOR[G.phosphorMode].glow; }
+function phosphorDim()     { return PHOSPHOR[G.phosphorMode].dim; }
+
+// Draw a glowing line (two-pass: soft glow + sharp core)
+function glowLine(ctx, x1, y1, x2, y2, color, width, glowColor, blurRadius) {
+  ctx.save();
+  // Pass 1: wide soft glow
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.strokeStyle = glowColor || color;
+  ctx.lineWidth = (width || 1) * 3.5;
+  ctx.globalAlpha = 0.25;
+  ctx.shadowColor = glowColor || color;
+  ctx.shadowBlur  = (blurRadius || 12) * 1.5;
+  ctx.stroke();
+  // Pass 2: sharp bright core
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width || 1;
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur  = blurRadius || 8;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Draw glowing arc/circle
+function glowArc(ctx, cx, cy, r, a0, a1, color, width, glowColor) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, a0, a1);
+  ctx.strokeStyle = glowColor || color;
+  ctx.lineWidth = (width || 1) * 3;
+  ctx.globalAlpha = 0.2;
+  ctx.shadowColor = glowColor || color;
+  ctx.shadowBlur  = 18;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, a0, a1);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width || 1;
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur  = 8;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Draw phosphor text (two-pass glow)
+function glowText(ctx, text, x, y, size, color, glowColor, align) {
+  ctx.save();
+  ctx.font = `${size || 13}px monospace`;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'top';
+  const c = color || phosphorPrimary();
+  const g = glowColor || phosphorGlow();
+
+  // Glow pass
+  ctx.fillStyle = g;
+  ctx.globalAlpha = 0.55;
+  ctx.shadowColor = g;
+  ctx.shadowBlur  = 14;
+  ctx.fillText(text, x, y);
+
+  // Sharp pass
+  ctx.fillStyle = c;
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur  = 5;
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+// --- Star field ---
+
+function initStars() {
+  G.stars = [];
+  for (let i = 0; i < 220; i++) {
+    G.stars.push({
+      sx: Math.random() * VIEW_W,
+      sy: Math.random() * VIEW_H,
+      brightness: 0.15 + Math.random() * 0.5,
+      size: Math.random() < 0.1 ? 2 : 1,
+    });
+  }
+}
+
+function drawStars(ctx) {
+  const dim = phosphorDim();
+  for (const s of G.stars) {
+    ctx.save();
+    ctx.globalAlpha = s.brightness;
+    ctx.fillStyle = dim;
+    ctx.fillRect(s.sx, s.sy, s.size, s.size);
+    ctx.restore();
+  }
+}
+
+// --- Sector grid ---
+
+function drawSectorGrid(ctx) {
+  const gridStep = 16; // world units per grid line
+  const px = gridStep * PPU;
+  const camX = G.player ? G.player.x : GRID_W / 2;
+  const camY = G.player ? G.player.y : GRID_H / 2;
+  const offX = ((camX % gridStep) * PPU);
+  const offY = ((camY % gridStep) * PPU);
+
+  ctx.save();
+  ctx.strokeStyle = phosphorDim();
+  ctx.globalAlpha = 0.12;
+  ctx.lineWidth = 0.5;
+  ctx.shadowBlur = 0;
+
+  for (let x = VIEW_W / 2 - offX; x >= 0; x -= px)       { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, VIEW_H); ctx.stroke(); }
+  for (let x = VIEW_W / 2 - offX + px; x < VIEW_W; x += px) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, VIEW_H); ctx.stroke(); }
+  for (let y = VIEW_H / 2 - offY; y >= 0; y -= px)       { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(VIEW_W, y); ctx.stroke(); }
+  for (let y = VIEW_H / 2 - offY + px; y < VIEW_H; y += px) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(VIEW_W, y); ctx.stroke(); }
+
+  ctx.restore();
+}
+
+// --- Planet rendering ---
+
+function drawPlanet(ctx, planet, sx, sy) {
+  const raceColor = planet.race !== null ? RACE_COLORS[planet.race] : '#888888';
+  const flicker = 0.82 + 0.18 * Math.sin(planet.flickerPhase);
+  const r = 9; // radius in pixels
+
+  ctx.save();
+  ctx.globalAlpha = flicker;
+
+  // Outer aura
+  ctx.beginPath();
+  ctx.arc(sx, sy, r * 2.2, 0, Math.PI * 2);
+  ctx.strokeStyle = raceColor;
+  ctx.lineWidth = 0.5;
+  ctx.globalAlpha = 0.18 * flicker;
+  ctx.shadowColor = raceColor;
+  ctx.shadowBlur  = 22;
+  ctx.stroke();
+
+  // Main circle
+  ctx.globalAlpha = flicker;
+  glowArc(ctx, sx, sy, r, 0, Math.PI * 2, raceColor, 1.5, raceColor);
+
+  // Home planet: extra ring
+  if (planet.isHome) {
+    glowArc(ctx, sx, sy, r + 5, 0, Math.PI * 2, raceColor, 0.8, raceColor);
+  }
+
+  ctx.restore();
+
+  // Label: race letter and planet id
+  const letter = planet.race !== null ? RACE_LETTERS[planet.race] : 'N';
+  glowText(ctx, letter, sx, sy - 6, 10, raceColor, raceColor, 'center');
+  glowText(ctx, String(planet.id), sx, sy + 4, 8, phosphorDim(), phosphorDim(), 'center');
+
+  // Armies indicator (small)
+  if (planet.armies > 0) {
+    glowText(ctx, `[${planet.armies}]`, sx, sy + 14, 7, raceColor, raceColor, 'center');
+  }
+}
+
+// --- Ship rendering ---
+
+function drawShip(ctx, ship, sx, sy) {
+  const raceColor = RACE_COLORS[ship.race];
+
+  // Draw engine trail first (behind ship)
+  for (let i = 0; i < ship.trail.length; i++) {
+    const pt = ship.trail[i];
+    const { sx: tsx, sy: tsy } = worldToScreen(pt.x, pt.y);
+    const alpha = Math.max(0, 1 - pt.age / 1.2) * 0.6;
+    if (alpha <= 0.02) continue;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = raceColor;
+    ctx.shadowColor = raceColor;
+    ctx.shadowBlur = 5;
+    const psize = 1 + (i / ship.trail.length) * 1.5;
+    ctx.fillRect(tsx - psize / 2, tsy - psize / 2, psize, psize);
+    ctx.restore();
+  }
+
+  // Ship body (triangle)
+  const size = ship.isPlayer ? 13 : 10;
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(ship.heading);
+
+  // Glow pass
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size * 0.5,  size * 0.55);
+  ctx.lineTo(-size * 0.28, 0);
+  ctx.lineTo(-size * 0.5, -size * 0.55);
+  ctx.closePath();
+  ctx.strokeStyle = raceColor;
+  ctx.lineWidth = ship.isPlayer ? 2 : 1.5;
+  ctx.shadowColor = raceColor;
+  ctx.shadowBlur = 14;
+  ctx.globalAlpha = 1;
+  ctx.stroke();
+
+  // Shield indicator when shields are active (faint circle)
+  if (!ship.shieldsDown && ship.shields > 20) {
+    const shieldAlpha = ship.shields / 100 * 0.25;
+    ctx.beginPath();
+    ctx.arc(0, 0, size * 1.5, 0, Math.PI * 2);
+    ctx.strokeStyle = raceColor;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = shieldAlpha;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // Label for non-player ships
+  if (!ship.isPlayer) {
+    glowText(ctx, RACE_NAMES[ship.race][0], sx + 15, sy - 15, 9, raceColor, raceColor, 'left');
+  } else {
+    // Player crosshair indicator
+    ctx.save();
+    ctx.strokeStyle = phosphorPrimary();
+    ctx.lineWidth = 0.5;
+    ctx.globalAlpha = 0.25;
+    ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.moveTo(sx - 22, sy); ctx.lineTo(sx - 14, sy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx + 14, sy); ctx.lineTo(sx + 22, sy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx, sy - 22); ctx.lineTo(sx, sy - 14); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx, sy + 14); ctx.lineTo(sx, sy + 22); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// --- Torpedo rendering ---
+
+function drawTorpedoes(ctx) {
+  for (const torp of G.torpedoes) {
+    const raceColor = RACE_COLORS[torp.ownerRace] || '#ffffff';
+    drawAtWrapped(torp.x, torp.y, (sx, sy) => {
+      // Bright core dot
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(sx, sy, 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = raceColor;
+      ctx.shadowBlur  = 18;
+      ctx.globalAlpha = 1;
+      ctx.fill();
+
+      // Trail line to previous position
+      const { sx: px, sy: py } = worldToScreen(torp.prevX, torp.prevY);
+      if (Math.hypot(sx - px, sy - py) < 60) { // don't draw across wrap seam
+        ctx.beginPath();
+        ctx.moveTo(px, py); ctx.lineTo(sx, sy);
+        ctx.strokeStyle = raceColor;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.6;
+        ctx.shadowBlur = 10;
+        ctx.stroke();
+      }
+      ctx.restore();
+    });
+  }
+}
+
+// --- Phaser / explosion FX ---
+
+function drawPhaserFX(ctx) {
+  for (const fx of G.phaserFX) {
+    const t = fx.age / PHASER_FX_DURATION;
+    const alpha = 1 - t;
+
+    if (fx.isExplosion) {
+      // Expanding ring for ship destruction
+      const expT = fx.age / 1.0;
+      const expAlpha = Math.max(0, 1 - expT);
+      const expR = expT * 30 * PPU * 0.1; // expand to 3 world units in pixels
+      drawAtWrapped(fx.x, fx.y, (sx, sy) => {
+        ctx.save();
+        ctx.globalAlpha = expAlpha * 0.9;
+        ctx.beginPath();
+        ctx.arc(sx, sy, expR, 0, Math.PI * 2);
+        ctx.strokeStyle = RACE_COLORS[fx.ownerRace] || phosphorPrimary();
+        ctx.lineWidth = 2;
+        ctx.shadowColor = phosphorGlow();
+        ctx.shadowBlur = 25;
+        ctx.stroke();
+        // Inner fill flash
+        ctx.globalAlpha = expAlpha * 0.3;
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.restore();
+      });
+      continue;
+    }
+
+    // Normal phaser cone
+    drawAtWrapped(fx.x, fx.y, (sx, sy) => {
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(fx.heading);
+
+      const range = PHASER_RANGE * PPU;
+      const half  = PHASER_HALF_ANGLE;
+
+      // Cone fill
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, range, -half, half);
+      ctx.closePath();
+      ctx.fillStyle = phosphorPrimary();
+      ctx.globalAlpha = alpha * 0.18;
+      ctx.shadowColor = phosphorGlow();
+      ctx.shadowBlur  = 25;
+      ctx.fill();
+
+      // Cone outline
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, range, -half, half);
+      ctx.closePath();
+      ctx.strokeStyle = phosphorPrimary();
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.stroke();
+
+      ctx.restore();
+    });
+  }
+}
+
+// --- Minimap (separate canvas) ---
+
+function renderMinimap() {
+  const ctx = G.mmCtx;
+  if (!ctx || !G.minimapVisible) return;
+
+  const S = MM_SIZE;
+  const P = MM_LABEL_H;
+  const W = S;
+  const H = MM_CANVAS_H;
+
+  // Clear to transparent so body background shows if desired
+  ctx.clearRect(0, 0, W, H);
+
+  // === "SECTOR MAP" label ===
+  ctx.save();
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  // Glow pass
+  ctx.fillStyle   = phosphorGlow();
+  ctx.shadowColor = phosphorGlow();
+  ctx.shadowBlur  = 10;
+  ctx.globalAlpha = 0.7;
+  ctx.fillText('SECTOR MAP', W / 2, 2);
+  // Sharp pass
+  ctx.fillStyle   = phosphorPrimary();
+  ctx.shadowBlur  = 3;
+  ctx.globalAlpha = 1;
+  ctx.fillText('SECTOR MAP', W / 2, 2);
+  ctx.restore();
+
+  // === Map area background (semi-transparent black) ===
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+  ctx.fillRect(0, P, S, S);
+
+  // Border (1px phosphor-colored)
+  ctx.strokeStyle = phosphorPrimary();
+  ctx.lineWidth   = 1;
+  ctx.shadowColor = phosphorGlow();
+  ctx.shadowBlur  = 5;
+  ctx.globalAlpha = 0.9;
+  ctx.strokeRect(0.5, P + 0.5, S - 1, S - 1);
+  ctx.shadowBlur  = 0;
+  ctx.globalAlpha = 1;
+
+  // Clip all subsequent drawing to the map area
+  ctx.beginPath();
+  ctx.rect(0, P, S, S);
+  ctx.clip();
+
+  // === Planets ===
+  for (const planet of G.planets) {
+    const px = planet.x * MM_SCALE;
+    const py = P + planet.y * MM_SCALE;
+
+    let color, blur, dotR;
+    if (planet.race === null) {
+      // Neutral: dim grey
+      color = '#555555'; blur = 1; dotR = 1.5;
+    } else if (planet.race === G.playerRace) {
+      // Player's race: full phosphor brightness
+      color = phosphorPrimary(); blur = 5; dotR = planet.isHome ? 2.5 : 2;
+    } else {
+      // Enemy race: medium brightness in race color
+      color = RACE_COLORS[planet.race]; blur = 3; dotR = planet.isHome ? 2 : 1.5;
+    }
+
+    ctx.beginPath();
+    ctx.arc(px, py, dotR, 0, Math.PI * 2);
+    ctx.fillStyle   = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur  = blur;
+    ctx.fill();
+  }
+
+  ctx.shadowBlur = 0;
+
+  // === AI ships (small triangles pointing in heading direction) ===
+  for (const ship of G.ships) {
+    if (!ship.alive || ship.isPlayer) continue;
+    const sx = ship.x * MM_SCALE;
+    const sy = P + ship.y * MM_SCALE;
+    const color = RACE_COLORS[ship.race];
+    const sz = 3.5; // triangle half-size in pixels
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(ship.heading);
+    ctx.beginPath();
+    ctx.moveTo( sz,    0);
+    ctx.lineTo(-sz,  sz * 0.65);
+    ctx.lineTo(-sz, -sz * 0.65);
+    ctx.closePath();
+    ctx.fillStyle   = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur  = 4;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // === Player ship (blinking + cross, independent 500 ms timer) ===
+  if (G.player && G.player.alive) {
+    const px = G.player.x * MM_SCALE;
+    const py = P + G.player.y * MM_SCALE;
+    const blinkOn = (Math.floor(Date.now() / 500) % 2) === 0;
+
+    if (blinkOn) {
+      const arm = 4.5;
+      ctx.strokeStyle = '#ffffff';
+      ctx.shadowColor = '#ffffff';
+      ctx.shadowBlur  = 8;
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(px - arm, py); ctx.lineTo(px + arm, py); // horizontal
+      ctx.moveTo(px, py - arm); ctx.lineTo(px, py + arm); // vertical
+      ctx.stroke();
+    } else {
+      // Dim cross when blink is off
+      const arm = 3.5;
+      ctx.strokeStyle = phosphorPrimary();
+      ctx.shadowColor = phosphorPrimary();
+      ctx.shadowBlur  = 3;
+      ctx.lineWidth   = 1;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(px - arm, py); ctx.lineTo(px + arm, py);
+      ctx.moveTo(px, py - arm); ctx.lineTo(px, py + arm);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // === Viewport rectangle (shows currently visible area) ===
+  // Visible area in world units: VIEW_W/PPU = 40 wide, VIEW_H/PPU = 40 tall
+  if (G.player) {
+    const viewWWorld = VIEW_W / PPU; // 40
+    const viewHWorld = VIEW_H / PPU; // 40
+    const vpLeft  = G.player.x - viewWWorld / 2;
+    const vpTop   = G.player.y - viewHWorld / 2;
+    const vpW_mm  = viewWWorld * MM_SCALE;
+    const vpH_mm  = viewHWorld * MM_SCALE;
+
+    ctx.strokeStyle = phosphorPrimary();
+    ctx.lineWidth   = 1;
+    ctx.globalAlpha = 0.55;
+    ctx.shadowBlur  = 0;
+    ctx.setLineDash([3, 2]);
+
+    // Draw rect pieces; try all 9 toroidal offset combinations so the rect
+    // correctly wraps when the player is near a grid edge.
+    for (let ox = -GRID_W; ox <= GRID_W; ox += GRID_W) {
+      for (let oy = -GRID_H; oy <= GRID_H; oy += GRID_H) {
+        const rx = (vpLeft + ox) * MM_SCALE;
+        const ry = P + (vpTop  + oy) * MM_SCALE;
+        // Reject pieces that don't overlap the map area at all
+        if (rx + vpW_mm <= 0 || rx >= S)     continue;
+        if (ry + vpH_mm <= P || ry >= P + S) continue;
+        ctx.strokeRect(rx, ry, vpW_mm, vpH_mm);
+      }
+    }
+
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore(); // restore clip
+}
+
+// --- CRT scanlines ---
+
+function drawScanlines(ctx) {
+  ctx.save();
+  ctx.globalAlpha = 0.035;
+  ctx.fillStyle = '#000000';
+  for (let y = 0; y < VIEW_H; y += 3) {
+    ctx.fillRect(0, y, VIEW_W, 1);
+  }
+  ctx.restore();
+}
+
+// --- HUD rendering ---
+
+function renderHUD() {
+  const ctx = G.hudCtx;
+  ctx.clearRect(0, 0, VIEW_W, HUD_H);
+
+  // Background
+  ctx.fillStyle = '#060606';
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+  // Top border
+  ctx.fillStyle = phosphorDim();
+  ctx.globalAlpha = 0.5;
+  ctx.fillRect(0, 0, VIEW_W, 1);
+  ctx.globalAlpha = 1;
+
+  if (G.phase !== 'PLAYING') return;
+
+  const p = G.player;
+  if (!p) return;
+
+  const nearPlanet = getNearestPlanetInRange(p, ORBIT_RANGE);
+  const headingDeg = Math.round(((p.heading * 180 / Math.PI) + 360)) % 360;
+
+  // === Line 1: navigation / ship status ===
+  const statusColor = phosphorPrimary();
+  const dimColor    = phosphorDim();
+  const flashOn = (Math.floor(G.gameTime * 2.5) % 2) === 0;
+
+  // Sector coords
+  glowText(ctx, `SEC:${Math.floor(p.x).toString().padStart(3,'0')},${Math.floor(p.y).toString().padStart(3,'0')}`, 8, 10, 12, statusColor);
+  glowText(ctx, `HDG:${headingDeg.toString().padStart(3,'0')}°`, 128, 10, 12, statusColor);
+  glowText(ctx, `WRP:${p.warp}`, 222, 10, 12, statusColor);
+
+  // Hull bar
+  const hullColor = p.hull > 50 ? statusColor : (p.hull > 25 ? '#ffaa00' : '#ff3333');
+  glowText(ctx, `HUL:${Math.ceil(p.hull).toString().padStart(3)}%`, 290, 10, 12, hullColor);
+
+  // Shield
+  const shldColor = p.shieldsDown ? (flashOn ? '#ff4444' : dimColor) : statusColor;
+  glowText(ctx, `SHD:${Math.ceil(p.shields).toString().padStart(3)}%`, 375, 10, 12, shldColor);
+
+  // Energy
+  const enrgColor = p.energy < 200 ? (flashOn ? '#ff4444' : '#ffaa00') : statusColor;
+  glowText(ctx, `NRG:${Math.floor(p.energy).toString().padStart(4)}`, 460, 10, 12, enrgColor);
+
+  // Race
+  glowText(ctx, RACE_NAMES[G.playerRace].toUpperCase(), 570, 10, 12, RACE_COLORS[G.playerRace]);
+
+  // === Line 2: weapons / armies / planet ===
+  glowText(ctx, `TORP:${p.torpedoes.toString().padStart(2)}`, 8, 30, 12, statusColor);
+  glowText(ctx, `ARMS:${p.armies.toString().padStart(2)}`, 90, 30, 12, statusColor);
+
+  // Planet in range
+  if (nearPlanet) {
+    const pColor = nearPlanet.race !== null ? RACE_COLORS[nearPlanet.race] : '#aaaaaa';
+    const pRace  = nearPlanet.race !== null ? RACE_NAMES[nearPlanet.race] : 'NEUTRAL';
+    glowText(ctx, `PLN:${nearPlanet.id} [${pRace.toUpperCase()}] DEF:${nearPlanet.defense} ARM:${nearPlanet.armies}`, 170, 30, 12, pColor);
+  } else {
+    glowText(ctx, 'PLN: ---', 170, 30, 12, dimColor);
+  }
+
+  // Landed / repairing indicator
+  if (p.landedOn) {
+    const repStr = p.repairing ? '⚙ REPAIRING' : '⚓ LANDED';
+    glowText(ctx, repStr, 520, 30, 12, '#44ff88');
+  }
+
+  // Self-destruct warning
+  if (G.selfDestructArmed && flashOn) {
+    glowText(ctx, '!! SELF-DESTRUCT ARMED !!', VIEW_W - 260, 30, 12, '#ff4444');
+  }
+
+  // === Line 3: damage warnings + messages ===
+  const warnY = 52;
+  let warnX = 8;
+  if (p.shieldsDown && flashOn) {
+    glowText(ctx, '!SHIELDS!', warnX, warnY, 11, '#ff4444'); warnX += 90;
+  }
+  if (p.weaponsDown && flashOn) {
+    glowText(ctx, '!WEAPONS!', warnX, warnY, 11, '#ff4444'); warnX += 90;
+  }
+  if (p.enginesDown && flashOn) {
+    glowText(ctx, '!ENGINES!', warnX, warnY, 11, '#ff4444'); warnX += 90;
+  }
+
+  // Latest message
+  if (G.messages.length > 0) {
+    const msg = G.messages[G.messages.length - 1];
+    const fade = Math.max(0, 1 - msg.age / msg.duration);
+    if (fade > 0.01) {
+      ctx.save();
+      ctx.globalAlpha = fade;
+      glowText(ctx, '> ' + msg.text, Math.max(warnX + 10, 290), warnY, 11, phosphorPrimary());
+      ctx.restore();
+    }
+  }
+}
+
+// --- Overlay screens ---
+
+function renderRaceSelect(ctx) {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // Title
+  glowText(ctx, 'P  L  A  T  O', VIEW_W / 2, 80, 38, phosphorPrimary(), phosphorGlow(), 'center');
+  glowText(ctx, 'E M P I R E', VIEW_W / 2, 130, 28, phosphorPrimary(), phosphorGlow(), 'center');
+
+  // Subtitle
+  glowText(ctx, '─── SPACE COMBAT SIMULATION ───', VIEW_W / 2, 190, 13, phosphorDim(), phosphorDim(), 'center');
+
+  glowText(ctx, 'SELECT YOUR EMPIRE:', VIEW_W / 2, 250, 15, phosphorPrimary(), phosphorGlow(), 'center');
+
+  const choices = [
+    { key: '1', name: 'FEDERATION', desc: 'Balanced diplomats of the galactic core', race: 0 },
+    { key: '2', name: 'ROMULAN',    desc: 'Cloaked warriors of the Neutral Zone',   race: 1 },
+    { key: '3', name: 'ORION',      desc: 'Rogue traders of the outer rim',         race: 2 },
+    { key: '4', name: 'KAZARI',     desc: 'Fierce nomads from the dark nebula',     race: 3 },
+  ];
+
+  choices.forEach((c, i) => {
+    const y = 300 + i * 80;
+    const color = RACE_COLORS[c.race];
+    glowText(ctx, `[${c.key}]  ${c.name}`, VIEW_W / 2, y, 20, color, color, 'center');
+    glowText(ctx, c.desc, VIEW_W / 2, y + 26, 11, phosphorDim(), phosphorDim(), 'center');
+  });
+
+  // Controls hint
+  glowText(ctx, 'CONTROLS: WASD=TURN/SPEED  T=TORPEDO  P=PHASERS', VIEW_W / 2, VIEW_H - 90, 10, phosphorDim(), phosphorDim(), 'center');
+  glowText(ctx, 'L=LAND  B=BEAM ARMIES  R=REPAIR  G=PHOSPHOR  M=MINIMAP  Q=SELF-DESTRUCT', VIEW_W / 2, VIEW_H - 70, 10, phosphorDim(), phosphorDim(), 'center');
+  glowText(ctx, '1-9=SET WARP  CONQUER ALL 25 PLANETS TO WIN', VIEW_W / 2, VIEW_H - 50, 10, phosphorDim(), phosphorDim(), 'center');
+
+  drawScanlines(ctx);
+}
+
+function renderEndScreen(ctx, won) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.82)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  const msg   = won ? 'VICTORY' : 'SHIP DESTROYED';
+  const sub   = won ? 'ALL PLANETS CONQUERED — THE GALAXY IS YOURS' : 'YOUR EMPIRE FALLS TO THE VOID';
+  const color = won ? '#ffdd44' : '#ff4444';
+
+  glowText(ctx, msg, VIEW_W / 2, VIEW_H / 2 - 60, 40, color, color, 'center');
+  glowText(ctx, sub, VIEW_W / 2, VIEW_H / 2,       14, phosphorPrimary(), phosphorGlow(), 'center');
+  glowText(ctx, 'PRESS  R  TO RESTART', VIEW_W / 2, VIEW_H / 2 + 60, 16, phosphorPrimary(), phosphorGlow(), 'center');
+
+  ctx.restore();
+}
+
+// --- Main render function ---
+
+function render() {
+  const ctx = G.ctx;
+
+  // Clear
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  if (G.phase === 'RACE_SELECT') {
+    renderRaceSelect(ctx);
+    renderHUD();
+    return;
+  }
+
+  // Game playing (or win/lose overlay on top)
+  drawStars(ctx);
+  drawSectorGrid(ctx);
+
+  // Planets
+  for (const planet of G.planets) {
+    drawAtWrapped(planet.x, planet.y, (sx, sy) => {
+      drawPlanet(ctx, planet, sx, sy);
+    });
+  }
+
+  // Phaser / explosion effects
+  drawPhaserFX(ctx);
+
+  // Torpedoes
+  drawTorpedoes(ctx);
+
+  // Ships
+  for (const ship of G.ships) {
+    if (!ship.alive) continue;
+    drawAtWrapped(ship.x, ship.y, (sx, sy) => {
+      drawShip(ctx, ship, sx, sy);
+    });
+  }
+
+  // Minimap (drawn to its own canvas each frame)
+  renderMinimap();
+
+  // Planet conquest progress
+  const conquered = G.planets.filter(p => p.race === G.playerRace).length;
+  glowText(ctx, `PLANETS: ${conquered}/25`, 8, 8, 11, phosphorDim());
+
+  // Scanlines
+  drawScanlines(ctx);
+
+  // Win/lose overlay
+  if (G.phase === 'WIN')  renderEndScreen(ctx, true);
+  if (G.phase === 'LOSE') renderEndScreen(ctx, false);
+
+  // HUD
+  renderHUD();
+}
+
+
+// =============================================================
+// SECTION 9: GAME LOOP & INIT
+// =============================================================
+
+function update(dt) {
+  if (G.phase !== 'PLAYING') return;
+
+  const p = G.player;
+
+  // Player input (continuous turning)
+  processInput(p, dt);
+
+  // Self-destruct timer
+  if (G.selfDestructArmed) {
+    G.selfDestructTimer -= dt;
+    if (G.selfDestructTimer <= 0) {
+      G.selfDestructArmed = false;
+      addMessage('SELF-DESTRUCT DISARMED');
+    }
+  }
+
+  // Update all ships
+  for (const ship of G.ships) {
+    updateShip(ship, dt);
+    if (!ship.isPlayer && ship.ai) updateAI(ship, dt);
+  }
+
+  // Torpedoes
+  updateTorpedoes(dt);
+
+  // Planets
+  updatePlanets(dt);
+
+  // Age phaser FX
+  G.phaserFX = G.phaserFX.filter(fx => {
+    fx.age += dt;
+    const maxAge = fx.isExplosion ? 1.0 : PHASER_FX_DURATION;
+    return fx.age < maxAge;
+  });
+
+  // Age messages
+  G.messages = G.messages.filter(m => {
+    m.age += dt;
+    return m.age < m.duration;
+  });
+}
+
+function gameLoop(timestamp) {
+  const rawDt = (timestamp - G.lastTimestamp) / 1000;
+  G.lastTimestamp = timestamp;
+  const dt = Math.min(rawDt, 0.1); // cap at 100ms to prevent spiral of death
+
+  G.gameTime += dt;
+
+  // Fixed physics steps
+  G.physicsAccum += dt;
+  while (G.physicsAccum >= PHYSICS_STEP) {
+    update(PHYSICS_STEP);
+    G.physicsAccum -= PHYSICS_STEP;
+  }
+
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+function startGame(playerRace) {
+  G.playerRace = playerRace;
+  G.phase = 'PLAYING';
+
+  // Reset state
+  G.ships     = [];
+  G.planets   = [];
+  G.torpedoes = [];
+  G.phaserFX  = [];
+  G.messages  = [];
+  G.selfDestructArmed = false;
+  G.gameTime  = 0;
+  G.physicsAccum = 0;
+
+  // Planet layout
+  G.planets = initPlanets();
+
+  // Home planet positions for each race (matching initPlanets corner logic)
+  const M = CORNER_MARGIN;
+  const homePos = [
+    [M,          M         ],   // Federation: top-left
+    [GRID_W - M, M         ],   // Romulan:    top-right
+    [M,          GRID_H - M],   // Orion:      bottom-left
+    [GRID_W - M, GRID_H - M],   // Kazari:     bottom-right
+  ];
+
+  // Player ship
+  const [px, py] = homePos[playerRace];
+  G.player = createShip(playerRace, px, py, true);
+  G.ships.push(G.player);
+
+  // AI ships (one per enemy race, start at their home corner)
+  for (let race = 0; race < 4; race++) {
+    if (race === playerRace) continue;
+    const [ax, ay] = homePos[race];
+    const aiShip = createShip(race, ax, ay, false);
+    // AI ships start with a waypoint aimed away from their corner
+    aiShip.ai.waypointX = GRID_W / 2 + (Math.random() - 0.5) * 60;
+    aiShip.ai.waypointY = GRID_H / 2 + (Math.random() - 0.5) * 60;
+    G.ships.push(aiShip);
+  }
+
+  addMessage(`EMPIRE ONLINE — ${RACE_NAMES[playerRace].toUpperCase()} COMMAND`);
+  addMessage('CONQUER ALL 25 PLANETS TO WIN');
+}
+
+function init() {
+  // Set up canvases
+  const gameCanvas = document.getElementById('gameCanvas');
+  const hudCanvas  = document.getElementById('hudCanvas');
+  const mmCanvas   = document.getElementById('minimapCanvas');
+
+  gameCanvas.width  = VIEW_W;
+  gameCanvas.height = VIEW_H;
+  hudCanvas.width   = VIEW_W;
+  hudCanvas.height  = HUD_H;
+  mmCanvas.width    = MM_SIZE;
+  mmCanvas.height   = MM_CANVAS_H;
+
+  G.ctx    = gameCanvas.getContext('2d');
+  G.hudCtx = hudCanvas.getContext('2d');
+  G.mmCtx  = mmCanvas.getContext('2d');
+
+  // Crisp pixel rendering
+  G.ctx.imageSmoothingEnabled    = false;
+  G.hudCtx.imageSmoothingEnabled = false;
+  G.mmCtx.imageSmoothingEnabled  = false;
+
+  initStars();
+
+  G.lastTimestamp = performance.now();
+  requestAnimationFrame(gameLoop);
+}
+
+// Boot
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
