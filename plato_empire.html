@@ -124,6 +124,15 @@ const MM_LABEL_H   = 16;            // space above map for "SECTOR MAP" label
 const MM_CANVAS_H  = MM_LABEL_H + MM_SIZE; // total canvas height
 const MM_SCALE     = MM_SIZE / GRID_W;     // world unit → minimap pixel
 
+// Hall of Fame / Scoring
+const SCORE_PLANET    = 100;   // per planet conquered
+const SCORE_KILL      = 250;   // per enemy ship destroyed
+const SCORE_WIN_BONUS = 2000;  // awarded on total victory
+const SCORE_ARMY_LOST = -5;    // per army lost in a failed assault
+const SCORE_DEATH     = -500;  // penalty for ship destruction
+const HOF_KEY         = 'plato_empire_hof';
+const HOF_MAX         = 10;
+
 
 // =============================================================
 // SECTION 2: GAME STATE
@@ -204,7 +213,7 @@ const G = {
   player:   null,
   playerRace: 0,
   phosphorMode: 'ORANGE',
-  phase: 'RACE_SELECT',   // RACE_SELECT | PLAYING | WIN | LOSE
+  phase: 'RACE_SELECT',   // RACE_SELECT | PLAYING | WIN | NAME_ENTRY | HALL_OF_FAME
   keys: {},
   messages: [],           // [{text, age, duration}]
   stars: [],
@@ -222,6 +231,14 @@ const G = {
   selfDestructTimer: 0,
   // Race select highlight
   raceSelectHover: 0,
+  // Scoring / Hall of Fame
+  score: 0,
+  kills: 0,
+  armiesLost: 0,
+  gameWon: false,
+  hof: [],              // top-10 entries loaded from localStorage
+  hofResumePhase: null, // phase to return to when dismissing HoF mid-game
+  nameText: '',         // player's name being typed on NAME_ENTRY screen
 };
 
 
@@ -253,15 +270,36 @@ const KEY_MAP = {
   'KeyV': 'toggleSound',
   'BracketLeft':  'volumeDown',
   'BracketRight': 'volumeUp',
+  'KeyH': 'hallOfFame',
 };
 
 document.addEventListener('keydown', e => {
+  // Bootstrap AudioContext on very first keypress (browser autoplay policy)
+  SoundManager.init();
+
+  // NAME_ENTRY: intercept raw key events — bypass KEY_MAP entirely
+  if (G.phase === 'NAME_ENTRY') {
+    e.preventDefault();
+    if (e.code === 'Enter') {
+      commitNameEntry();
+    } else if (e.code === 'Backspace') {
+      G.nameText = G.nameText.slice(0, -1);
+    } else if (e.key.length === 1 && G.nameText.length < 12) {
+      G.nameText = (G.nameText + e.key).toUpperCase();
+    }
+    return;
+  }
+
+  // HALL_OF_FAME: any key dismisses and returns to resume phase
+  if (G.phase === 'HALL_OF_FAME') {
+    e.preventDefault();
+    dismissHallOfFame();
+    return;
+  }
+
   const action = KEY_MAP[e.code];
   if (!action) return;
   e.preventDefault();
-
-  // Bootstrap AudioContext on very first keypress (browser autoplay policy)
-  SoundManager.init();
 
   // Sound controls work in all phases
   if (action === 'toggleSound') {
@@ -294,12 +332,13 @@ document.addEventListener('keydown', e => {
     if (e.code === 'Digit2') startGame(1);
     if (e.code === 'Digit3') startGame(2);
     if (e.code === 'Digit4') startGame(3);
+    if (action === 'hallOfFame') openHallOfFame('RACE_SELECT');
     return;
   }
 
-  // Win/Lose restart
-  if (G.phase === 'WIN' || G.phase === 'LOSE') {
-    if (e.code === 'KeyR') { G.phase = 'RACE_SELECT'; return; }
+  // WIN: any key skips to name entry
+  if (G.phase === 'WIN') {
+    G.phase = 'NAME_ENTRY';
     return;
   }
 
@@ -325,6 +364,7 @@ document.addEventListener('keydown', e => {
     G.phosphorMode = G.phosphorMode === 'ORANGE' ? 'GREEN' : 'ORANGE';
     addMessage('PHOSPHOR: ' + G.phosphorMode);
   }
+  if (action === 'hallOfFame') openHallOfFame('PLAYING');
 });
 
 document.addEventListener('keyup', e => {
@@ -846,7 +886,7 @@ function firePhasers(ship) {
 
     if (Math.abs(angleDiff) <= PHASER_HALF_ANGLE) {
       const falloff = 1 - d / PHASER_RANGE;
-      applyDamage(target, PHASER_DAMAGE * falloff);
+      applyDamage(target, PHASER_DAMAGE * falloff, ship.race);
     }
   }
 }
@@ -878,7 +918,7 @@ function updateTorpedoes(dt) {
 
       const d = toroidalDist(torp.x, torp.y, ship.x, ship.y);
       if (d < 1.8) {
-        applyDamage(ship, TORPEDO_DAMAGE);
+        applyDamage(ship, TORPEDO_DAMAGE, torp.ownerRace);
         torpedoSplash(torp.x, torp.y, torp.ownerRace);
         SoundManager.explosion();
         torp.alive = false;
@@ -911,12 +951,12 @@ function torpedoSplash(cx, cy, ownerRace) {
     const d = toroidalDist(cx, cy, ship.x, ship.y);
     if (d < TORPEDO_SPLASH_R) {
       const falloff = 1 - d / TORPEDO_SPLASH_R;
-      applyDamage(ship, TORPEDO_SPLASH_DMG * falloff);
+      applyDamage(ship, TORPEDO_SPLASH_DMG * falloff, ownerRace);
     }
   }
 }
 
-function applyDamage(ship, amount) {
+function applyDamage(ship, amount, attackerRace = -1) {
   if (!ship.alive) return;
 
   // Capture pre-damage flag state for change detection
@@ -937,6 +977,12 @@ function applyDamage(ship, amount) {
   updateDamageFlags(ship);
 
   if (ship.hull <= 0) {
+    // Award kill score if the player destroyed an enemy ship
+    if (attackerRace === G.playerRace && !ship.isPlayer) {
+      G.score += SCORE_KILL;
+      G.kills += 1;
+      addMessage(`ENEMY ${RACE_NAMES[ship.race].toUpperCase()} DESTROYED! +${SCORE_KILL} PTS`);
+    }
     destroyShip(ship);
   } else if (ship.isPlayer) {
     SoundManager.damage();
@@ -961,8 +1007,10 @@ function destroyShip(ship) {
   G.phaserFX.push(fx);
 
   if (ship.isPlayer) {
+    G.score += SCORE_DEATH;
+    G.gameWon = false;
     setTimeout(() => {
-      G.phase = 'LOSE';
+      G.phase = 'NAME_ENTRY';
     }, 1200);
   }
 }
@@ -1281,14 +1329,19 @@ function beamDown(ship, planet) {
       planet.defense = Math.max(1, Math.floor(netForce / 2));
       planet.armies  = Math.floor(netForce / 2);
       if (ship.isPlayer) {
+        G.score += SCORE_PLANET;
         SoundManager.planetConquered();
-        addMessage(`PLANET ${planet.id} CONQUERED! (was ${prevRace !== null ? RACE_NAMES[prevRace] : 'Neutral'})`);
+        addMessage(`PLANET ${planet.id} CONQUERED! +${SCORE_PLANET} PTS (was ${prevRace !== null ? RACE_NAMES[prevRace] : 'Neutral'})`);
       }
       checkWinCondition();
     } else {
       // Assault failed
       planet.defense -= beamed;
-      if (ship.isPlayer) addMessage(`ASSAULT FAILED — ${planet.defense} DEFENDERS REMAIN`);
+      if (ship.isPlayer) {
+        G.score += SCORE_ARMY_LOST * beamed;
+        G.armiesLost += beamed;
+        addMessage(`ASSAULT FAILED — ${planet.defense} DEFENDERS REMAIN`);
+      }
     }
   }
 }
@@ -1297,14 +1350,161 @@ function checkWinCondition() {
   if (G.phase !== 'PLAYING') return; // prevent re-entry
   const allOwned = G.planets.every(p => p.race === G.playerRace);
   if (allOwned) {
+    G.score += SCORE_WIN_BONUS;
+    G.gameWon = true;
     G.phase = 'WIN'; // immediate so no further actions process
-    addMessage('ALL PLANETS CONQUERED — VICTORY!');
+    addMessage(`ALL PLANETS CONQUERED — VICTORY! +${SCORE_WIN_BONUS} BONUS`);
+    setTimeout(() => {
+      if (G.phase === 'WIN') G.phase = 'NAME_ENTRY';
+    }, 2800);
   }
 }
 
 function addMessage(text, duration = 3.5) {
   G.messages.push({ text, age: 0, duration });
   if (G.messages.length > 6) G.messages.shift();
+}
+
+
+// =============================================================
+// SECTION 7.5: HALL OF FAME SYSTEM
+// =============================================================
+
+function loadHof() {
+  try {
+    const raw = localStorage.getItem(HOF_KEY);
+    G.hof = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    G.hof = [];
+  }
+}
+
+function saveHofEntry(name) {
+  const entry = {
+    name: (name || 'ANONYMOUS').toUpperCase().slice(0, 12),
+    score: G.score,
+    race: G.playerRace,
+    won: G.gameWon,
+    date: new Date().toLocaleDateString(),
+  };
+  G.hof.push(entry);
+  G.hof.sort((a, b) => b.score - a.score);
+  if (G.hof.length > HOF_MAX) G.hof.length = HOF_MAX;
+  try {
+    localStorage.setItem(HOF_KEY, JSON.stringify(G.hof));
+  } catch (e) { /* storage unavailable */ }
+}
+
+function commitNameEntry() {
+  const name = G.nameText.trim() || 'ANONYMOUS';
+  saveHofEntry(name);
+  G.nameText = '';
+  G.phase = 'HALL_OF_FAME';
+  G.hofResumePhase = 'RACE_SELECT';
+}
+
+function openHallOfFame(resumePhase) {
+  loadHof(); // refresh in case another tab updated it
+  G.hofResumePhase = resumePhase || 'RACE_SELECT';
+  G.phase = 'HALL_OF_FAME';
+}
+
+function dismissHallOfFame() {
+  G.phase = G.hofResumePhase || 'RACE_SELECT';
+  G.hofResumePhase = null;
+}
+
+function renderNameEntry(ctx) {
+  const pal = PHOSPHOR[G.phosphorMode];
+
+  // Draw world underneath if game was in progress
+  if (G.ships.length > 0) {
+    drawStars(ctx);
+    drawSectorGrid(ctx);
+  }
+
+  // Dark overlay
+  ctx.fillStyle = 'rgba(0,0,0,0.88)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  const cx = VIEW_W / 2;
+  const won = G.gameWon;
+  const titleColor = won ? '#ffdd44' : '#ff4444';
+  const titleText  = won ? 'VICTORY!' : 'SHIP DESTROYED';
+  const subText    = won ? 'THE GALAXY IS YOURS' : 'YOUR EMPIRE FALLS TO THE VOID';
+
+  glowText(ctx, titleText, cx, 115, 38, titleColor, titleColor, 'center');
+  glowText(ctx, subText,   cx, 168, 14, pal.primary, pal.glow,  'center');
+  glowText(ctx, `FINAL SCORE: ${G.score}`, cx, 210, 18, pal.primary, pal.glow, 'center');
+
+  const statsY = 244;
+  const statsSpacing = 200;
+  glowText(ctx, `PLANETS: ${G.planets.filter(p => p.race === G.playerRace).length}/25`, cx - statsSpacing, statsY, 12, pal.dim, pal.dim, 'center');
+  glowText(ctx, `KILLS: ${G.kills}`,             cx,               statsY, 12, pal.dim, pal.dim, 'center');
+  glowText(ctx, `ARMIES LOST: ${G.armiesLost}`,  cx + statsSpacing, statsY, 12, pal.dim, pal.dim, 'center');
+
+  glowText(ctx, 'ENTER YOUR NAME FOR THE HALL OF FAME:', cx, 292, 13, pal.primary, pal.glow, 'center');
+
+  // Name input box
+  const boxW = 280, boxH = 38, boxX = cx - boxW / 2, boxY = 316;
+  ctx.save();
+  ctx.strokeStyle = pal.primary;
+  ctx.lineWidth   = 1.5;
+  ctx.shadowColor = pal.glow;
+  ctx.shadowBlur  = 12;
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+  ctx.restore();
+
+  const cursor = (Math.floor(G.gameTime * 2) % 2 === 0) ? '_' : ' ';
+  glowText(ctx, G.nameText + cursor, cx, boxY + 10, 16, pal.primary, pal.glow, 'center');
+
+  glowText(ctx, 'ENTER = CONFIRM  ·  MAX 12 CHARACTERS', cx, 376, 11, pal.dim, pal.dim, 'center');
+
+  drawScanlines(ctx);
+}
+
+function renderHallOfFame(ctx) {
+  const pal = PHOSPHOR[G.phosphorMode];
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  glowText(ctx, 'P L A T O   E M P I R E', VIEW_W / 2, 38,  13, pal.dim,     pal.dim,  'center');
+  glowText(ctx, '═══  HALL OF FAME  ═══',  VIEW_W / 2, 64,  20, pal.primary, pal.glow, 'center');
+
+  const tX = 100, tY = 118, rowH = 38;
+  // Header
+  glowText(ctx, 'RANK  NAME           RACE         SCORE    RESULT  DATE', tX, tY, 11, pal.dim, pal.dim);
+  // Separator line
+  ctx.save();
+  ctx.strokeStyle = pal.dim;
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(tX, tY + 16);
+  ctx.lineTo(VIEW_W - tX, tY + 16);
+  ctx.stroke();
+  ctx.restore();
+
+  if (G.hof.length === 0) {
+    glowText(ctx, '( NO ENTRIES YET — BE THE FIRST! )', VIEW_W / 2, tY + 55, 13, pal.dim, pal.dim, 'center');
+  } else {
+    G.hof.forEach((entry, i) => {
+      const y = tY + 26 + i * rowH;
+      // Rank colour: gold / silver / bronze / normal
+      const rankColor = i === 0 ? '#ffdd44' : i === 1 ? '#bbbbbb' : i === 2 ? '#cc8844' : pal.primary;
+      const wlColor   = entry.won ? '#44ff88' : '#ff5555';
+      const wlText    = entry.won ? 'VICTORY' : 'DEFEAT';
+      const name  = (entry.name  || '???').padEnd(14).slice(0, 14);
+      const race  = (RACE_NAMES[entry.race] || '?').toUpperCase().padEnd(12).slice(0, 12);
+      const score = entry.score.toString().padStart(7);
+      glowText(ctx, `  ${(i + 1).toString().padStart(2)}.  ${name}  ${race}  ${score}`, tX, y, 13, rankColor, rankColor);
+      glowText(ctx, wlText,           tX + 540, y, 12, wlColor,   wlColor);
+      glowText(ctx, entry.date || '', tX + 615, y, 11, pal.dim,   pal.dim);
+    });
+  }
+
+  glowText(ctx, 'PRESS ANY KEY TO CONTINUE', VIEW_W / 2, VIEW_H - 55, 13, pal.primary, pal.glow, 'center');
+  drawScanlines(ctx);
 }
 
 
@@ -1876,8 +2076,10 @@ function renderHUD() {
   const enrgColor = p.energy < 200 ? (flashOn ? '#ff4444' : '#ffaa00') : statusColor;
   glowText(ctx, `NRG:${Math.floor(p.energy).toString().padStart(4)}`, 460, 10, 12, enrgColor);
 
+  // Score
+  glowText(ctx, `SCR:${G.score.toString().padStart(6)}`, 540, 10, 12, statusColor);
   // Race
-  glowText(ctx, RACE_NAMES[G.playerRace].toUpperCase(), 570, 10, 12, RACE_COLORS[G.playerRace]);
+  glowText(ctx, RACE_NAMES[G.playerRace].toUpperCase(), 680, 10, 12, RACE_COLORS[G.playerRace]);
 
   // === Line 2: weapons / armies / planet ===
   glowText(ctx, `TORP:${p.torpedoes.toString().padStart(2)}`, 8, 30, 12, statusColor);
@@ -1961,7 +2163,7 @@ function renderRaceSelect(ctx) {
   // Controls hint
   glowText(ctx, 'CONTROLS: WASD=TURN/SPEED  T=TORPEDO  P=PHASERS  1-9=SET WARP', VIEW_W / 2, VIEW_H - 90, 10, phosphorDim(), phosphorDim(), 'center');
   glowText(ctx, 'L=LAND  B=BEAM ARMIES  R=REPAIR  G=PHOSPHOR  M=MINIMAP  Q=SELF-DESTRUCT', VIEW_W / 2, VIEW_H - 72, 10, phosphorDim(), phosphorDim(), 'center');
-  glowText(ctx, 'V=MUTE  [ ]=VOLUME  ·  CONQUER ALL 25 PLANETS TO WIN', VIEW_W / 2, VIEW_H - 54, 10, phosphorDim(), phosphorDim(), 'center');
+  glowText(ctx, 'V=MUTE  [ ]=VOLUME  H=HALL OF FAME  ·  CONQUER ALL 25 PLANETS TO WIN', VIEW_W / 2, VIEW_H - 54, 10, phosphorDim(), phosphorDim(), 'center');
 
   drawScanlines(ctx);
 }
@@ -1977,7 +2179,9 @@ function renderEndScreen(ctx, won) {
 
   glowText(ctx, msg, VIEW_W / 2, VIEW_H / 2 - 60, 40, color, color, 'center');
   glowText(ctx, sub, VIEW_W / 2, VIEW_H / 2,       14, phosphorPrimary(), phosphorGlow(), 'center');
-  glowText(ctx, 'PRESS  R  TO RESTART', VIEW_W / 2, VIEW_H / 2 + 60, 16, phosphorPrimary(), phosphorGlow(), 'center');
+  glowText(ctx, `SCORE: ${G.score}`, VIEW_W / 2, VIEW_H / 2 + 44, 18, color, color, 'center');
+  glowText(ctx, 'ENTERING HALL OF FAME...', VIEW_W / 2, VIEW_H / 2 + 80, 13, phosphorPrimary(), phosphorGlow(), 'center');
+  glowText(ctx, '(PRESS ANY KEY TO CONTINUE)', VIEW_W / 2, VIEW_H / 2 + 102, 11, phosphorDim(), phosphorDim(), 'center');
 
   ctx.restore();
 }
@@ -1994,6 +2198,18 @@ function render() {
 
   if (G.phase === 'RACE_SELECT') {
     renderRaceSelect(ctx);
+    renderHUD();
+    return;
+  }
+
+  if (G.phase === 'NAME_ENTRY') {
+    renderNameEntry(ctx);
+    renderHUD();
+    return;
+  }
+
+  if (G.phase === 'HALL_OF_FAME') {
+    renderHallOfFame(ctx);
     renderHUD();
     return;
   }
@@ -2033,9 +2249,8 @@ function render() {
   // Scanlines
   drawScanlines(ctx);
 
-  // Win/lose overlay
-  if (G.phase === 'WIN')  renderEndScreen(ctx, true);
-  if (G.phase === 'LOSE') renderEndScreen(ctx, false);
+  // Win overlay (shows briefly before NAME_ENTRY kicks in)
+  if (G.phase === 'WIN') renderEndScreen(ctx, true);
 
   // HUD
   renderHUD();
@@ -2130,6 +2345,12 @@ function startGame(playerRace) {
   G.selfDestructArmed = false;
   G.gameTime  = 0;
   G.physicsAccum = 0;
+  // Reset scoring stats
+  G.score      = 0;
+  G.kills      = 0;
+  G.armiesLost = 0;
+  G.gameWon    = false;
+  G.nameText   = '';
 
   // Cancel any lingering low-energy warning from a previous game
   SoundManager.stopLowEnergyWarning();
@@ -2189,6 +2410,7 @@ function init() {
   G.mmCtx.imageSmoothingEnabled  = false;
 
   initStars();
+  loadHof();
 
   G.lastTimestamp = performance.now();
   requestAnimationFrame(gameLoop);
