@@ -1,7 +1,9 @@
 # plato_empire
 
 How to play
-Open plato_empire.html in a desktop browser, press 1–4 to pick your empire, then:
+Point browser to: https://halliday2026.github.io/plato_empire/plato_empire.html
+
+Press 1–4 to pick your empire, then:
 
 A/D — rotate heading | W/S — increase/decrease warp | 1–9 — set warp directly
 T — fire torpedo | P — fire phasers | G — toggle orange/green phosphor
