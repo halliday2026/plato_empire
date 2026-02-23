@@ -1614,9 +1614,6 @@ function renderTitle(ctx) {
 // RACE SELECTION SCREEN (enhanced)
 // -------------------------------------------------------
 function renderRaceSelectMinimap() {
-  // Always ensure minimap canvas is visible during race selection
-  const mmEl = document.getElementById('minimapCanvas');
-  if (mmEl) mmEl.style.display = 'block';
   const ctx = G.mmCtx;
   if (!ctx) return;
   const pal = PHOSPHOR[G.phosphorMode];
@@ -2624,9 +2621,6 @@ function renderRaceSelect(ctx) {
   glowText(ctx, '\u2190 \u2192  Navigate    \u00b7    Enter  Confirm    \u00b7    I  Instructions    \u00b7    H  Hall of Fame',
     VIEW_W / 2, VIEW_H - 32, 10, pal.dim, pal.dim, 'center');
 
-  // Draw minimap preview
-  renderRaceSelectMinimap();
-
   drawScanlines(ctx);
 }
 
@@ -2657,6 +2651,15 @@ function render() {
   ctx.clearRect(0, 0, VIEW_W, VIEW_H);
   ctx.fillStyle = '#000000';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // --- Minimap canvas visibility: only show during active gameplay ---
+  {
+    const mmEl = document.getElementById('minimapCanvas');
+    if (mmEl) {
+      const gameActive = G.phase === 'PLAYING' || G.phase === 'WIN';
+      mmEl.style.display = (gameActive && G.minimapVisible) ? 'block' : 'none';
+    }
+  }
 
   // --- Phase-specific screens ---
   if (G.phase === 'TITLE') {
