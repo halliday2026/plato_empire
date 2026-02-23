@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>PLATO Empire</title>
+<meta name="description" content="EMPIRE — A faithful recreation of the classic PLATO system space combat game (1973)">
+<title>EMPIRE — A PLATO Classic Recreation</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -20,6 +21,7 @@
     position: relative;
     display: flex;
     flex-direction: column;
+    transform-origin: top center;
   }
   #gameCanvas { display: block; cursor: crosshair; }
   #hudCanvas  { display: block; margin-top: 3px; }
@@ -124,6 +126,31 @@ const MM_LABEL_H   = 16;            // space above map for "SECTOR MAP" label
 const MM_CANVAS_H  = MM_LABEL_H + MM_SIZE; // total canvas height
 const MM_SCALE     = MM_SIZE / GRID_W;     // world unit → minimap pixel
 
+// Race-specific stat modifiers  [speedMult, hullMult, weaponMult, energyMult]
+const RACE_MODS = [
+  { speedMult: 1.0,  hullMult: 1.0,  weaponMult: 1.0,  energyMult: 1.0 }, // Federation: balanced
+  { speedMult: 1.2,  hullMult: 0.85, weaponMult: 1.0,  energyMult: 1.0 }, // Romulan: fast, fragile
+  { speedMult: 1.0,  hullMult: 1.0,  weaponMult: 1.25, energyMult: 0.8 }, // Orion: hard punch, low energy
+  { speedMult: 0.8,  hullMult: 1.3,  weaponMult: 1.0,  energyMult: 1.0 }, // Kazari: armored, slow
+];
+const RACE_FLAVOR = [
+  'Defenders of order. Balanced and resilient.',
+  'Masters of stealth. Fast and aggressive.',
+  'Pirates of the void. High risk, high reward.',
+  'Ancient warriors. Heavy armor, slow speed.',
+];
+// 3-line ASCII ship art per race
+const RACE_SHIP_ART = [
+  ['  /\\  ', ' /==\\ ', '/====\\'],   // Federation
+  [' \\ / ', '=>-<= ', ' / \\ '],    // Romulan (Bird of Prey)
+  ['  |>> ', '/====> ', ' \\__/ '],  // Orion (pirate raider)
+  ['[####]', '[====] ', '[####]'],  // Kazari (heavy plated)
+];
+
+// Transition / cinematic timing
+const FADE_DURATION       = 0.5;   // seconds for fade in/out
+const CINEMATIC_DURATION  = 4.5;   // seconds for text crawl screen
+
 // Hall of Fame / Scoring
 const SCORE_PLANET    = 100;   // per planet conquered
 const SCORE_KILL      = 250;   // per enemy ship destroyed
@@ -141,14 +168,21 @@ const HOF_MAX         = 10;
 // --- Factory functions ---
 
 function createShip(race, x, y, isPlayer) {
+  const mod      = RACE_MODS[race] || RACE_MODS[0];
+  const hullMax  = Math.round(100       * mod.hullMult);
+  const energyMax = Math.round(ENERGY_MAX * mod.energyMult);
   return {
     race, isPlayer, alive: true,
     x, y,
     heading: 0,           // radians (0 = right, PI/2 = down)
     warp: 0,
-    hull: 100,            // 100 = full health, 0 = destroyed
+    hull: hullMax,        // starts full; 0 = destroyed
+    hullMax,
     shields: 100,         // 0-100 absorb rating
-    energy: ENERGY_MAX,
+    energy: energyMax,
+    energyMax,
+    speedMult:  mod.speedMult,   // applied to WARP_SPEEDS lookup
+    weaponMult: mod.weaponMult,  // applied to torpedo + phaser damage
     torpedoes: TORPEDO_START,
     armies: ARMY_START,
     torpedoCooldown: 0,
@@ -213,7 +247,7 @@ const G = {
   player:   null,
   playerRace: 0,
   phosphorMode: 'ORANGE',
-  phase: 'RACE_SELECT',   // RACE_SELECT | PLAYING | WIN | NAME_ENTRY | HALL_OF_FAME
+  phase: 'TITLE',         // TITLE | RACE_SELECT | PLAYING | WIN | CINEMATIC | NAME_ENTRY | HALL_OF_FAME | INSTRUCTIONS
   keys: {},
   messages: [],           // [{text, age, duration}]
   stars: [],
@@ -239,6 +273,20 @@ const G = {
   hof: [],              // top-10 entries loaded from localStorage
   hofResumePhase: null, // phase to return to when dismissing HoF mid-game
   nameText: '',         // player's name being typed on NAME_ENTRY screen
+  // Title screen
+  titleStars: [],       // [{x,y,speed,brightness}] drifting down the title screen
+  // Instructions overlay
+  instructionsPage: 0,  // 0 or 1
+  instructionsResume: 'TITLE', // phase to return to on dismiss
+  // Fade transitions
+  fadeAlpha: 0,
+  fadeDir: 0,           // 0=idle, -1=fading-out, +1=fading-in
+  fadeElapsed: 0,
+  fadeTarget: null,     // phase to switch to when black
+  fadeCallback: null,   // optional function called at moment of phase switch
+  // Cinematic text crawl (shown before NAME_ENTRY)
+  cinematicAge: 0,
+  cinematicText: '',
 };
 
 
@@ -274,8 +322,30 @@ const KEY_MAP = {
 };
 
 document.addEventListener('keydown', e => {
+  // Always prevent Tab from leaving canvas focus
+  if (e.code === 'Tab') { e.preventDefault(); return; }
+
   // Bootstrap AudioContext on very first keypress (browser autoplay policy)
   SoundManager.init();
+
+  // TITLE screen
+  if (G.phase === 'TITLE') {
+    e.preventDefault();
+    if (e.code === 'Enter') {
+      startFade('RACE_SELECT');
+    } else if (e.code === 'KeyI') {
+      G.instructionsResume = 'TITLE';
+      startFade('INSTRUCTIONS');
+    }
+    return;
+  }
+
+  // CINEMATIC: any key skips the crawl
+  if (G.phase === 'CINEMATIC') {
+    e.preventDefault();
+    G.phase = 'NAME_ENTRY';
+    return;
+  }
 
   // NAME_ENTRY: intercept raw key events — bypass KEY_MAP entirely
   if (G.phase === 'NAME_ENTRY') {
@@ -294,6 +364,19 @@ document.addEventListener('keydown', e => {
   if (G.phase === 'HALL_OF_FAME') {
     e.preventDefault();
     dismissHallOfFame();
+    return;
+  }
+
+  // INSTRUCTIONS overlay: navigate pages or dismiss
+  if (G.phase === 'INSTRUCTIONS') {
+    e.preventDefault();
+    if (e.code === 'ArrowRight' || e.code === 'ArrowDown' || e.code === 'PageDown') {
+      G.instructionsPage = Math.min(1, G.instructionsPage + 1);
+    } else if (e.code === 'ArrowLeft' || e.code === 'ArrowUp' || e.code === 'PageUp') {
+      G.instructionsPage = Math.max(0, G.instructionsPage - 1);
+    } else if (e.code === 'Escape' || e.code === 'KeyI') {
+      startFade(G.instructionsResume || 'TITLE');
+    }
     return;
   }
 
@@ -326,19 +409,28 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  // Race select screen
+  // RACE_SELECT screen: arrow keys to navigate, Enter to confirm, digits as shortcuts
   if (G.phase === 'RACE_SELECT') {
-    if (e.code === 'Digit1') startGame(0);
-    if (e.code === 'Digit2') startGame(1);
-    if (e.code === 'Digit3') startGame(2);
-    if (e.code === 'Digit4') startGame(3);
-    if (action === 'hallOfFame') openHallOfFame('RACE_SELECT');
+    if (action === 'turnLeft' || action === 'thrustUp') {
+      G.raceSelectHover = (G.raceSelectHover + 3) % 4;
+    } else if (action === 'turnRight' || action === 'thrustDown') {
+      G.raceSelectHover = (G.raceSelectHover + 1) % 4;
+    } else if (e.code === 'Enter') {
+      startFade('PLAYING', () => startGame(G.raceSelectHover));
+    } else if (e.code === 'Digit1') { G.raceSelectHover = 0; startFade('PLAYING', () => startGame(0)); }
+    else if (e.code === 'Digit2') { G.raceSelectHover = 1; startFade('PLAYING', () => startGame(1)); }
+    else if (e.code === 'Digit3') { G.raceSelectHover = 2; startFade('PLAYING', () => startGame(2)); }
+    else if (e.code === 'Digit4') { G.raceSelectHover = 3; startFade('PLAYING', () => startGame(3)); }
+    else if (action === 'hallOfFame') openHallOfFame('RACE_SELECT');
+    else if (e.code === 'KeyI') { G.instructionsResume = 'RACE_SELECT'; startFade('INSTRUCTIONS'); }
     return;
   }
 
-  // WIN: any key skips to name entry
+  // WIN: any key skips to cinematic (set text here in case timeout hasn't fired yet)
   if (G.phase === 'WIN') {
-    G.phase = 'NAME_ENTRY';
+    G.cinematicText = `The galaxy bows to ${RACE_NAMES[G.playerRace]} supremacy. Your name will echo across the stars.`;
+    G.cinematicAge  = 0;
+    G.phase = 'CINEMATIC';
     return;
   }
 
@@ -365,6 +457,10 @@ document.addEventListener('keydown', e => {
     addMessage('PHOSPHOR: ' + G.phosphorMode);
   }
   if (action === 'hallOfFame') openHallOfFame('PLAYING');
+  if (e.code === 'KeyI') {
+    G.instructionsResume = 'PLAYING';
+    startFade('INSTRUCTIONS');
+  }
 });
 
 document.addEventListener('keyup', e => {
@@ -782,10 +878,10 @@ function updateShip(ship, dt) {
       if (ship.isPlayer) addMessage('PLANET LOST — EJECTED FROM ORBIT');
     } else {
       // Energy regen
-      ship.energy = Math.min(ENERGY_MAX, ship.energy + ENERGY_REGEN * dt);
+      ship.energy = Math.min(ship.energyMax || ENERGY_MAX, ship.energy + ENERGY_REGEN * dt);
       // Repair
       if (ship.repairing && ship.energy > 10) {
-        ship.hull = Math.min(100, ship.hull + REPAIR_RATE * dt);
+        ship.hull = Math.min(ship.hullMax || 100, ship.hull + REPAIR_RATE * dt);
         ship.energy -= REPAIR_ENERGY_COST * dt;
       }
     }
@@ -795,9 +891,9 @@ function updateShip(ship, dt) {
     return;
   }
 
-  // Movement
-  const speedMult = ship.enginesDown ? 0.3 : 1.0;
-  const speed = WARP_SPEEDS[ship.warp] * speedMult;
+  // Movement — combine engine-damage penalty with race speed multiplier
+  const engineMult = ship.enginesDown ? 0.3 : 1.0;
+  const speed = WARP_SPEEDS[ship.warp] * engineMult * (ship.speedMult || 1);
 
   ship.x += Math.cos(ship.heading) * speed * dt;
   ship.y += Math.sin(ship.heading) * speed * dt;
@@ -826,9 +922,10 @@ function updateShip(ship, dt) {
 }
 
 function updateDamageFlags(ship) {
-  ship.shieldsDown = ship.hull < THRESH_SHIELDS;
-  ship.weaponsDown = ship.hull < THRESH_WEAPONS;
-  ship.enginesDown = ship.hull < THRESH_ENGINES;
+  const hullPct = ship.hull / (ship.hullMax || 100) * 100;
+  ship.shieldsDown = hullPct < THRESH_SHIELDS;
+  ship.weaponsDown = hullPct < THRESH_WEAPONS;
+  ship.enginesDown = hullPct < THRESH_ENGINES;
 }
 
 function updateCooldowns(ship, dt) {
@@ -852,7 +949,9 @@ function fireTorpedo(ship) {
   ship.energy -= TORPEDO_ENERGY;
   ship.torpedoCooldown = TORPEDO_COOLDOWN;
 
-  G.torpedoes.push(createTorpedo(ship.race, ship.x, ship.y, ship.heading));
+  const torp = createTorpedo(ship.race, ship.x, ship.y, ship.heading);
+  torp.dmgMult = ship.weaponMult || 1;
+  G.torpedoes.push(torp);
   if (ship.isPlayer) SoundManager.torpedo();
 }
 
@@ -886,7 +985,7 @@ function firePhasers(ship) {
 
     if (Math.abs(angleDiff) <= PHASER_HALF_ANGLE) {
       const falloff = 1 - d / PHASER_RANGE;
-      applyDamage(target, PHASER_DAMAGE * falloff, ship.race);
+      applyDamage(target, PHASER_DAMAGE * falloff * (ship.weaponMult || 1), ship.race);
     }
   }
 }
@@ -918,8 +1017,8 @@ function updateTorpedoes(dt) {
 
       const d = toroidalDist(torp.x, torp.y, ship.x, ship.y);
       if (d < 1.8) {
-        applyDamage(ship, TORPEDO_DAMAGE, torp.ownerRace);
-        torpedoSplash(torp.x, torp.y, torp.ownerRace);
+        applyDamage(ship, TORPEDO_DAMAGE * (torp.dmgMult || 1), torp.ownerRace);
+        torpedoSplash(torp.x, torp.y, torp.ownerRace, torp.dmgMult || 1);
         SoundManager.explosion();
         torp.alive = false;
         hit = true;
@@ -932,7 +1031,7 @@ function updateTorpedoes(dt) {
     for (const planet of G.planets) {
       const d = toroidalDist(torp.x, torp.y, planet.x, planet.y);
       if (d < 1.2) {
-        torpedoSplash(torp.x, torp.y, torp.ownerRace);
+        torpedoSplash(torp.x, torp.y, torp.ownerRace, torp.dmgMult || 1);
         SoundManager.explosion();
         torp.alive = false;
         break;
@@ -943,7 +1042,7 @@ function updateTorpedoes(dt) {
   G.torpedoes = G.torpedoes.filter(t => t.alive);
 }
 
-function torpedoSplash(cx, cy, ownerRace) {
+function torpedoSplash(cx, cy, ownerRace, dmgMult = 1) {
   for (const ship of G.ships) {
     if (!ship.alive) continue;
     if (ownerRace !== -1 && ship.race === ownerRace) continue;
@@ -951,7 +1050,7 @@ function torpedoSplash(cx, cy, ownerRace) {
     const d = toroidalDist(cx, cy, ship.x, ship.y);
     if (d < TORPEDO_SPLASH_R) {
       const falloff = 1 - d / TORPEDO_SPLASH_R;
-      applyDamage(ship, TORPEDO_SPLASH_DMG * falloff, ownerRace);
+      applyDamage(ship, TORPEDO_SPLASH_DMG * falloff * dmgMult, ownerRace);
     }
   }
 }
@@ -1010,7 +1109,9 @@ function destroyShip(ship) {
     G.score += SCORE_DEATH;
     G.gameWon = false;
     setTimeout(() => {
-      G.phase = 'NAME_ENTRY';
+      G.cinematicText = 'Your ship drifts silent in the void. The war continues without you, Commander.';
+      G.cinematicAge  = 0;
+      G.phase = 'CINEMATIC';
     }, 1200);
   }
 }
@@ -1355,7 +1456,11 @@ function checkWinCondition() {
     G.phase = 'WIN'; // immediate so no further actions process
     addMessage(`ALL PLANETS CONQUERED — VICTORY! +${SCORE_WIN_BONUS} BONUS`);
     setTimeout(() => {
-      if (G.phase === 'WIN') G.phase = 'NAME_ENTRY';
+      if (G.phase === 'WIN') {
+        G.cinematicText = `The galaxy bows to ${RACE_NAMES[G.playerRace]} supremacy. Your name will echo across the stars.`;
+        G.cinematicAge  = 0;
+        G.phase = 'CINEMATIC';
+      }
     }, 2800);
   }
 }
@@ -1412,6 +1517,305 @@ function openHallOfFame(resumePhase) {
 function dismissHallOfFame() {
   G.phase = G.hofResumePhase || 'RACE_SELECT';
   G.hofResumePhase = null;
+}
+
+// -------------------------------------------------------
+// Fade helper — call startFade('TARGET') to cross-fade
+// between screens. Optional callback fires at black.
+// -------------------------------------------------------
+function startFade(targetPhase, callback) {
+  if (G.fadeDir !== 0) return; // already fading
+  G.fadeTarget   = targetPhase;
+  G.fadeCallback = callback || null;
+  G.fadeDir      = -1; // fade out first
+  G.fadeElapsed  = 0;
+  G.fadeAlpha    = 0;
+}
+
+// -------------------------------------------------------
+// Title-screen star field (slowly drifting down)
+// -------------------------------------------------------
+function initTitleStars() {
+  G.titleStars = [];
+  for (let i = 0; i < 180; i++) {
+    G.titleStars.push({
+      x:          Math.random() * VIEW_W,
+      y:          Math.random() * VIEW_H,
+      speed:      10 + Math.random() * 25,
+      brightness: 0.1 + Math.random() * 0.6,
+      size:       Math.random() < 0.12 ? 2 : 1,
+    });
+  }
+}
+
+function updateTitleStars(dt) {
+  for (const s of G.titleStars) {
+    s.y += s.speed * dt;
+    if (s.y > VIEW_H) { s.y = 0; s.x = Math.random() * VIEW_W; }
+  }
+}
+
+// -------------------------------------------------------
+// TITLE SCREEN
+// -------------------------------------------------------
+function renderTitle(ctx) {
+  const pal = PHOSPHOR[G.phosphorMode];
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // Drifting stars
+  for (const s of G.titleStars) {
+    ctx.save();
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = s.brightness;
+    ctx.fillRect(Math.round(s.x), Math.round(s.y), s.size, s.size);
+    ctx.restore();
+  }
+
+  // Sub-label above ASCII block art
+  glowText(ctx, 'P  L  A  T  O', VIEW_W / 2, 72, 22, pal.primary, pal.glow, 'center');
+
+  // ASCII block art for EMPIRE (5 rows, centered)
+  const art = [
+    '\u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588    \u2588\u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588\u2588\u2588 ',
+    '\u2588\u2588      \u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      ',
+    '\u2588\u2588\u2588\u2588\u2588   \u2588\u2588 \u2588\u2588\u2588\u2588 \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588   ',
+    '\u2588\u2588      \u2588\u2588  \u2588\u2588  \u2588\u2588 \u2588\u2588      \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588      ',
+    '\u2588\u2588\u2588\u2588\u2588\u2588\u2588 \u2588\u2588      \u2588\u2588 \u2588\u2588      \u2588\u2588 \u2588\u2588   \u2588\u2588 \u2588\u2588\u2588\u2588\u2588\u2588\u2588 ',
+  ];
+  const artSize = 13;
+  const artStartY = 118;
+  art.forEach((line, i) => {
+    glowText(ctx, line, VIEW_W / 2, artStartY + i * (artSize + 4), artSize, pal.primary, pal.glow, 'center');
+  });
+
+  // Subtitle
+  glowText(ctx, 'A faithful recreation of the classic PLATO system game (1973)',
+    VIEW_W / 2, 310, 11, pal.dim, pal.dim, 'center');
+
+  // Blinking "PRESS ENTER" prompt
+  if (Math.floor(G.gameTime * 1.5) % 2 === 0) {
+    glowText(ctx, 'PRESS  ENTER  TO BEGIN, COMMANDER',
+      VIEW_W / 2, 390, 16, pal.primary, pal.glow, 'center');
+  }
+
+  // Instructions hint
+  glowText(ctx, 'Press  I  for Instructions', VIEW_W / 2, 440, 11, pal.dim, pal.dim, 'center');
+
+  // Credits at bottom
+  glowText(ctx,
+    'Original game by various PLATO authors  \u00b7  Web recreation by [YOUR NAME]',
+    VIEW_W / 2, VIEW_H - 36, 10, pal.dim, pal.dim, 'center');
+
+  drawScanlines(ctx);
+}
+
+// -------------------------------------------------------
+// RACE SELECTION SCREEN (enhanced)
+// -------------------------------------------------------
+function renderRaceSelectMinimap() {
+  // Always ensure minimap canvas is visible during race selection
+  const mmEl = document.getElementById('minimapCanvas');
+  if (mmEl) mmEl.style.display = 'block';
+  const ctx = G.mmCtx;
+  if (!ctx) return;
+  const pal = PHOSPHOR[G.phosphorMode];
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, MM_SIZE, MM_CANVAS_H);
+
+  // "SECTOR MAP" label
+  ctx.save();
+  ctx.fillStyle = pal.dim;
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('SECTOR MAP', MM_SIZE / 2, MM_LABEL_H - 3);
+  ctx.restore();
+
+  // Grid border
+  ctx.save();
+  ctx.strokeStyle = pal.dim;
+  ctx.globalAlpha = 0.25;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(1, MM_LABEL_H + 1, MM_SIZE - 2, MM_SIZE - 2);
+  ctx.restore();
+
+  // Home corner positions per race (approximate, pre-game)
+  const M = CORNER_MARGIN;
+  const homeCorners = [
+    [M, M],                       // Federation TL
+    [GRID_W - M, M],              // Romulan TR
+    [M, GRID_H - M],              // Orion BL
+    [GRID_W - M, GRID_H - M],     // Kazari BR
+  ];
+
+  for (let r = 0; r < 4; r++) {
+    const [wx, wy] = homeCorners[r];
+    const mx = wx * MM_SCALE;
+    const my = MM_LABEL_H + wy * MM_SCALE;
+    const isSelected = r === G.raceSelectHover;
+    ctx.save();
+    ctx.fillStyle = RACE_COLORS[r];
+    ctx.globalAlpha = isSelected ? 1.0 : 0.3;
+    ctx.shadowColor = RACE_COLORS[r];
+    ctx.shadowBlur  = isSelected ? 8 : 0;
+    ctx.beginPath();
+    ctx.arc(mx, my, isSelected ? 5 : 3, 0, Math.PI * 2);
+    ctx.fill();
+    // Label
+    ctx.font      = '8px monospace';
+    ctx.textAlign = 'center';
+    const lx = mx + (mx < MM_SIZE / 2 ? 14 : -14);
+    const ly = my + (my < MM_CANVAS_H / 2 ? 10 : -5);
+    ctx.fillText(RACE_LETTERS[r], lx, ly);
+    ctx.restore();
+  }
+}
+
+// -------------------------------------------------------
+// INSTRUCTIONS SCREEN
+// -------------------------------------------------------
+const INSTRUCTIONS_PAGES = [
+  // Page 0: Controls reference
+  [
+    ['KEYBOARD CONTROLS', null, 'header'],
+    ['', null, 'gap'],
+    ['MOVEMENT', null, 'section'],
+    ['W / \u2191', 'Increase warp speed'],
+    ['S / \u2193', 'Decrease warp speed'],
+    ['A / \u2190', 'Turn left'],
+    ['D / \u2192', 'Turn right'],
+    ['1 \u2013 9', 'Set warp speed directly'],
+    ['', null, 'gap'],
+    ['COMBAT', null, 'section'],
+    ['T', 'Fire torpedo'],
+    ['P', 'Fire phasers'],
+    ['Q', 'Arm self-destruct (Q again to confirm)'],
+    ['', null, 'gap'],
+    ['SHIP SYSTEMS', null, 'section'],
+    ['L', 'Land on friendly planet'],
+    ['B', 'Beam down armies'],
+    ['R', 'Toggle repair mode (must be landed)'],
+    ['', null, 'gap'],
+    ['DISPLAY / MISC', null, 'section'],
+    ['G', 'Toggle phosphor color'],
+    ['M', 'Toggle mini-map'],
+    ['H', 'Hall of Fame'],
+    ['I', 'Instructions (this screen)'],
+    ['V', 'Toggle mute  |  [ / ]  Volume'],
+  ],
+  // Page 1: Lore & objectives
+  [
+    ['OBJECTIVE', null, 'header'],
+    ['', null, 'gap'],
+    ['Conquer all 25 planets in the sector to achieve', null, 'lore'],
+    ['galactic supremacy. Each race begins with three', null, 'lore'],
+    ['home planets at their corner of the sector grid.', null, 'lore'],
+    ['', null, 'gap'],
+    ['THE FOUR RACES', null, 'section'],
+    ['FEDERATION', 'Balanced defenders. Top-left corner.'],
+    ['ROMULAN', '+20% speed, -15% hull. Top-right.'],
+    ['ORION', '+25% weapon damage, -20% energy. Bottom-left.'],
+    ['KAZARI', '+30% hull, -20% speed. Bottom-right.'],
+    ['', null, 'gap'],
+    ['SCORING', null, 'section'],
+    ['+100', 'Per planet conquered'],
+    ['+250', 'Per enemy ship destroyed'],
+    ['+2000', 'Galaxy conquest bonus'],
+    ['-5', 'Per army lost in failed assault'],
+    ['-500', 'Ship destruction penalty'],
+    ['', null, 'gap'],
+    ['Press  H  at any time to view the Hall of Fame.', null, 'lore'],
+  ],
+];
+
+function renderInstructions(ctx) {
+  const pal  = PHOSPHOR[G.phosphorMode];
+  const page = INSTRUCTIONS_PAGES[G.instructionsPage] || INSTRUCTIONS_PAGES[0];
+
+  // Semi-transparent background so the game world shows through if paused
+  ctx.fillStyle = 'rgba(0,0,0,0.92)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // Title bar
+  glowText(ctx, `INSTRUCTIONS  \u2014  PAGE ${G.instructionsPage + 1} / 2`,
+    VIEW_W / 2, 30, 14, pal.primary, pal.glow, 'center');
+
+  // Content
+  const colK = 140;   // key column x
+  const colV = 310;   // value column x
+  let y = 80;
+  for (const row of page) {
+    const [key, val, type] = row;
+    if (type === 'header') {
+      glowText(ctx, key, VIEW_W / 2, y, 16, pal.primary, pal.glow, 'center');
+      y += 24;
+    } else if (type === 'section') {
+      glowText(ctx, key, colK, y, 12, pal.dim, pal.dim);
+      y += 20;
+    } else if (type === 'gap') {
+      y += 8;
+    } else if (type === 'lore') {
+      glowText(ctx, key, VIEW_W / 2, y, 12, pal.primary, phosphorGlow(), 'center');
+      y += 18;
+    } else {
+      glowText(ctx, key, colK, y, 13, pal.primary, pal.glow, 'right');
+      if (val) glowText(ctx, val, colV, y, 12, pal.dim, pal.dim);
+      y += 18;
+    }
+  }
+
+  // Navigation hint
+  glowText(ctx, '\u2190 \u2192  Change page    \u00b7    I or Esc  Dismiss',
+    VIEW_W / 2, VIEW_H - 36, 11, pal.dim, pal.dim, 'center');
+  glowText(ctx,
+    G.instructionsPage === 0 ? '\u25ba  Page 2: Lore & Scoring' : '\u25c4  Page 1: Controls',
+    VIEW_W / 2, VIEW_H - 18, 11, pal.dim, pal.dim, 'center');
+
+  drawScanlines(ctx);
+}
+
+// -------------------------------------------------------
+// CINEMATIC TEXT CRAWL (before NAME_ENTRY)
+// -------------------------------------------------------
+function renderCinematic(ctx) {
+  const pal  = PHOSPHOR[G.phosphorMode];
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  const charsPerSec = 32;
+  const visible = G.cinematicText.slice(0, Math.min(G.cinematicText.length, Math.floor(G.cinematicAge * charsPerSec)));
+
+  // Word-wrap the visible text
+  const words = visible.split(' ');
+  const lines  = [];
+  let cur = '';
+  for (const w of words) {
+    const candidate = cur ? cur + ' ' + w : w;
+    if (candidate.length > 38) { lines.push(cur); cur = w; }
+    else cur = candidate;
+  }
+  if (cur) lines.push(cur);
+
+  const lineH  = 34;
+  const totalH = lines.length * lineH;
+  const startY = Math.round(VIEW_H / 2 - totalH / 2);
+
+  lines.forEach((line, i) => {
+    const fadeIn = Math.min(1, G.cinematicAge - i * 0.15);
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, fadeIn);
+    glowText(ctx, line, VIEW_W / 2, startY + i * lineH, 20, pal.primary, pal.glow, 'center');
+    ctx.restore();
+  });
+
+  const allShown = visible.length >= G.cinematicText.length;
+  if (allShown && G.cinematicAge > G.cinematicText.length / charsPerSec + 1.5) {
+    if (Math.floor(G.gameTime * 2) % 2 === 0) {
+      glowText(ctx, 'PRESS ANY KEY TO CONTINUE', VIEW_W / 2, VIEW_H - 55, 11, pal.dim, pal.dim, 'center');
+    }
+  }
+
+  drawScanlines(ctx);
 }
 
 function renderNameEntry(ctx) {
@@ -2066,7 +2470,7 @@ function renderHUD() {
 
   // Hull bar
   const hullColor = p.hull > 50 ? statusColor : (p.hull > 25 ? '#ffaa00' : '#ff3333');
-  glowText(ctx, `HUL:${Math.ceil(p.hull).toString().padStart(3)}%`, 290, 10, 12, hullColor);
+  glowText(ctx, `HUL:${Math.ceil(p.hull / (p.hullMax || 100) * 100).toString().padStart(3)}%`, 290, 10, 12, hullColor);
 
   // Shield
   const shldColor = p.shieldsDown ? (flashOn ? '#ff4444' : dimColor) : statusColor;
@@ -2134,36 +2538,94 @@ function renderHUD() {
 // --- Overlay screens ---
 
 function renderRaceSelect(ctx) {
+  const pal = PHOSPHOR[G.phosphorMode];
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-  // Title
-  glowText(ctx, 'P  L  A  T  O', VIEW_W / 2, 80, 38, phosphorPrimary(), phosphorGlow(), 'center');
-  glowText(ctx, 'E M P I R E', VIEW_W / 2, 130, 28, phosphorPrimary(), phosphorGlow(), 'center');
+  glowText(ctx, 'CHOOSE YOUR ALLEGIANCE', VIEW_W / 2, 36, 18, pal.primary, pal.glow, 'center');
+  glowText(ctx, '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500', VIEW_W / 2, 60, 11, pal.dim, pal.dim, 'center');
 
-  // Subtitle
-  glowText(ctx, '─── SPACE COMBAT SIMULATION ───', VIEW_W / 2, 190, 13, phosphorDim(), phosphorDim(), 'center');
+  // 2 × 2 grid layout
+  const BOX_W = 340, BOX_H = 200;
+  const COL_X = [36, VIEW_W - 36 - BOX_W];   // left edge of each column
+  const ROW_Y = [80,  80 + BOX_H + 18];       // top edge of each row
+  const ORDER = [0, 1, 2, 3];                  // race index order in grid
 
-  glowText(ctx, 'SELECT YOUR EMPIRE:', VIEW_W / 2, 250, 15, phosphorPrimary(), phosphorGlow(), 'center');
+  ORDER.forEach(race => {
+    const col    = race % 2;
+    const row    = Math.floor(race / 2);
+    const bx     = COL_X[col];
+    const by     = ROW_Y[row];
+    const color  = RACE_COLORS[race];
+    const mod    = RACE_MODS[race];
+    const isSelected = race === G.raceSelectHover;
 
-  const choices = [
-    { key: '1', name: 'FEDERATION', desc: 'Balanced diplomats of the galactic core', race: 0 },
-    { key: '2', name: 'ROMULAN',    desc: 'Cloaked warriors of the Neutral Zone',   race: 1 },
-    { key: '3', name: 'ORION',      desc: 'Rogue traders of the outer rim',         race: 2 },
-    { key: '4', name: 'KAZARI',     desc: 'Fierce nomads from the dark nebula',     race: 3 },
-  ];
+    // Box border
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = isSelected ? 2 : 1;
+    ctx.globalAlpha = isSelected ? 1.0 : 0.35;
+    ctx.shadowColor = color;
+    ctx.shadowBlur  = isSelected ? 16 : 0;
+    ctx.strokeRect(bx, by, BOX_W, BOX_H);
+    if (isSelected) {
+      ctx.globalAlpha = 0.06;
+      ctx.fillStyle   = color;
+      ctx.fillRect(bx, by, BOX_W, BOX_H);
+    }
+    ctx.restore();
 
-  choices.forEach((c, i) => {
-    const y = 300 + i * 80;
-    const color = RACE_COLORS[c.race];
-    glowText(ctx, `[${c.key}]  ${c.name}`, VIEW_W / 2, y, 20, color, color, 'center');
-    glowText(ctx, c.desc, VIEW_W / 2, y + 26, 11, phosphorDim(), phosphorDim(), 'center');
+    const alpha = isSelected ? 1.0 : 0.5;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // Race name + digit key
+    const raceName = RACE_NAMES[race].toUpperCase();
+    glowText(ctx, `[${race + 1}]  ${raceName}`, bx + BOX_W / 2, by + 16, 16, color, color, 'center');
+
+    // ASCII ship art (3 lines)
+    RACE_SHIP_ART[race].forEach((line, li) => {
+      glowText(ctx, line, bx + BOX_W / 2, by + 44 + li * 16, 13, color, color, 'center');
+    });
+
+    // Flavor description
+    glowText(ctx, RACE_FLAVOR[race], bx + BOX_W / 2, by + 110, 11, pal.dim, pal.dim, 'center');
+
+    // Stat bars (compact)
+    const statY = by + 132;
+    const stats = [
+      { label: 'SPD', val: mod.speedMult },
+      { label: 'HUL', val: mod.hullMult  },
+      { label: 'WPN', val: mod.weaponMult },
+      { label: 'NRG', val: mod.energyMult },
+    ];
+    stats.forEach((s, si) => {
+      const sx = bx + 18 + si * 78;
+      glowText(ctx, s.label, sx, statY, 10, pal.dim, pal.dim);
+      // Simple bar
+      const barW = 60, barH = 6;
+      const filled = Math.round(barW * Math.min(s.val, 1.5) / 1.5);
+      ctx.save();
+      ctx.fillStyle = pal.dim;
+      ctx.globalAlpha *= 0.4;
+      ctx.fillRect(sx, statY + 13, barW, barH);
+      ctx.fillStyle   = color;
+      ctx.globalAlpha = alpha * (s.val >= 1 ? 1.0 : 0.6);
+      ctx.shadowColor = color;
+      ctx.shadowBlur  = 4;
+      ctx.fillRect(sx, statY + 13, filled, barH);
+      ctx.restore();
+    });
+
+    ctx.restore();
   });
 
-  // Controls hint
-  glowText(ctx, 'CONTROLS: WASD=TURN/SPEED  T=TORPEDO  P=PHASERS  1-9=SET WARP', VIEW_W / 2, VIEW_H - 90, 10, phosphorDim(), phosphorDim(), 'center');
-  glowText(ctx, 'L=LAND  B=BEAM ARMIES  R=REPAIR  G=PHOSPHOR  M=MINIMAP  Q=SELF-DESTRUCT', VIEW_W / 2, VIEW_H - 72, 10, phosphorDim(), phosphorDim(), 'center');
-  glowText(ctx, 'V=MUTE  [ ]=VOLUME  H=HALL OF FAME  ·  CONQUER ALL 25 PLANETS TO WIN', VIEW_W / 2, VIEW_H - 54, 10, phosphorDim(), phosphorDim(), 'center');
+  // Navigation / confirm hint
+  glowText(ctx, '\u2190 \u2192  Navigate    \u00b7    Enter  Confirm    \u00b7    I  Instructions    \u00b7    H  Hall of Fame',
+    VIEW_W / 2, VIEW_H - 32, 10, pal.dim, pal.dim, 'center');
+
+  // Draw minimap preview
+  renderRaceSelectMinimap();
 
   drawScanlines(ctx);
 }
@@ -2196,64 +2658,69 @@ function render() {
   ctx.fillStyle = '#000000';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-  if (G.phase === 'RACE_SELECT') {
+  // --- Phase-specific screens ---
+  if (G.phase === 'TITLE') {
+    renderTitle(ctx);
+    renderHUD();
+  } else if (G.phase === 'RACE_SELECT') {
     renderRaceSelect(ctx);
     renderHUD();
-    return;
-  }
-
-  if (G.phase === 'NAME_ENTRY') {
+  } else if (G.phase === 'INSTRUCTIONS') {
+    // Show game world underneath if we came from PLAYING
+    if (G.instructionsResume === 'PLAYING' && G.ships.length > 0) {
+      drawStars(ctx);
+      drawSectorGrid(ctx);
+    }
+    renderInstructions(ctx);
+    renderHUD();
+  } else if (G.phase === 'CINEMATIC') {
+    renderCinematic(ctx);
+    renderHUD();
+  } else if (G.phase === 'NAME_ENTRY') {
     renderNameEntry(ctx);
     renderHUD();
-    return;
-  }
-
-  if (G.phase === 'HALL_OF_FAME') {
+  } else if (G.phase === 'HALL_OF_FAME') {
     renderHallOfFame(ctx);
     renderHUD();
-    return;
+  } else {
+    // PLAYING / WIN
+    drawStars(ctx);
+    drawSectorGrid(ctx);
+
+    for (const planet of G.planets) {
+      drawAtWrapped(planet.x, planet.y, (sx, sy) => drawPlanet(ctx, planet, sx, sy));
+    }
+
+    drawPhaserFX(ctx);
+    drawTorpedoes(ctx);
+
+    for (const ship of G.ships) {
+      if (!ship.alive) continue;
+      drawAtWrapped(ship.x, ship.y, (sx, sy) => drawShip(ctx, ship, sx, sy));
+    }
+
+    renderMinimap();
+
+    // Planet conquest progress
+    const conquered = G.planets.filter(p => p.race === G.playerRace).length;
+    glowText(ctx, `PLANETS: ${conquered}/25`, 8, 8, 11, phosphorDim());
+
+    drawScanlines(ctx);
+
+    // WIN: brief overlay before CINEMATIC transition
+    if (G.phase === 'WIN') renderEndScreen(ctx, true);
+
+    renderHUD();
   }
 
-  // Game playing (or win/lose overlay on top)
-  drawStars(ctx);
-  drawSectorGrid(ctx);
-
-  // Planets
-  for (const planet of G.planets) {
-    drawAtWrapped(planet.x, planet.y, (sx, sy) => {
-      drawPlanet(ctx, planet, sx, sy);
-    });
+  // --- Fade overlay (drawn last, on top of everything) ---
+  if (G.fadeAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = G.fadeAlpha;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.restore();
   }
-
-  // Phaser / explosion effects
-  drawPhaserFX(ctx);
-
-  // Torpedoes
-  drawTorpedoes(ctx);
-
-  // Ships
-  for (const ship of G.ships) {
-    if (!ship.alive) continue;
-    drawAtWrapped(ship.x, ship.y, (sx, sy) => {
-      drawShip(ctx, ship, sx, sy);
-    });
-  }
-
-  // Minimap (drawn to its own canvas each frame)
-  renderMinimap();
-
-  // Planet conquest progress
-  const conquered = G.planets.filter(p => p.race === G.playerRace).length;
-  glowText(ctx, `PLANETS: ${conquered}/25`, 8, 8, 11, phosphorDim());
-
-  // Scanlines
-  drawScanlines(ctx);
-
-  // Win overlay (shows briefly before NAME_ENTRY kicks in)
-  if (G.phase === 'WIN') renderEndScreen(ctx, true);
-
-  // HUD
-  renderHUD();
 }
 
 
@@ -2317,11 +2784,43 @@ function update(dt) {
 function gameLoop(timestamp) {
   const rawDt = (timestamp - G.lastTimestamp) / 1000;
   G.lastTimestamp = timestamp;
-  const dt = Math.min(rawDt, 0.1); // cap at 100ms to prevent spiral of death
+  const dt = Math.min(rawDt, 0.1); // cap at 100ms
 
   G.gameTime += dt;
 
-  // Fixed physics steps
+  // --- Title-screen drifting stars ---
+  if (G.phase === 'TITLE') updateTitleStars(dt);
+
+  // --- Cinematic age counter ---
+  if (G.phase === 'CINEMATIC') {
+    G.cinematicAge += dt;
+    if (G.cinematicAge >= CINEMATIC_DURATION) {
+      G.phase = 'NAME_ENTRY';
+    }
+  }
+
+  // --- Fade transitions ---
+  if (G.fadeDir !== 0) {
+    G.fadeElapsed += dt;
+    if (G.fadeDir === -1) {
+      // Fading OUT → going to black
+      G.fadeAlpha = Math.min(1, G.fadeElapsed / FADE_DURATION);
+      if (G.fadeAlpha >= 1) {
+        // Black: switch phase, fire callback
+        if (G.fadeCallback) { G.fadeCallback(); G.fadeCallback = null; }
+        if (G.fadeTarget)   { G.phase = G.fadeTarget; G.fadeTarget = null; }
+        // Now fade IN
+        G.fadeDir     = 1;
+        G.fadeElapsed = 0;
+      }
+    } else {
+      // Fading IN → clearing black
+      G.fadeAlpha = Math.max(0, 1 - G.fadeElapsed / FADE_DURATION);
+      if (G.fadeAlpha <= 0) G.fadeDir = 0;
+    }
+  }
+
+  // --- Fixed physics steps (only while PLAYING) ---
   G.physicsAccum += dt;
   while (G.physicsAccum >= PHYSICS_STEP) {
     update(PHYSICS_STEP);
@@ -2410,7 +2909,20 @@ function init() {
   G.mmCtx.imageSmoothingEnabled  = false;
 
   initStars();
+  initTitleStars();
   loadHof();
+
+  // Responsive scaling: CSS-transform the container to fill the window
+  function handleResize() {
+    const totalH = VIEW_H + HUD_H + 6;
+    const scaleX = (window.innerWidth  - 10) / VIEW_W;
+    const scaleY = (window.innerHeight - 10) / totalH;
+    const scale  = Math.min(scaleX, scaleY);
+    const el     = document.getElementById('gameContainer');
+    if (el) el.style.transform = `scale(${scale})`;
+  }
+  window.addEventListener('resize', handleResize);
+  handleResize();
 
   G.lastTimestamp = performance.now();
   requestAnimationFrame(gameLoop);
